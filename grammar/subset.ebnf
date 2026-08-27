@@ -1,25 +1,43 @@
-(* Python-subset grammar — the source language this compiler accepts.
-   Every construct here MUST have a deterministic codegen rule.
-   Anything outside this grammar is a syntax error, not an AI job. *)
+(* ------------------------------------------------------------------ *)
+(* The Python subset this compiler accepts.                             *)
+(*                                                                      *)
+(* Every construct below has a deterministic codegen rule in            *)
+(* src/codegen/rules.py. Anything outside this grammar is a syntax      *)
+(* error, not something to hand to a language model.                    *)
+(*                                                                      *)
+(* Programs written in this subset are valid Python 3, so `python`      *)
+(* itself is the correctness oracle for the generated C.                *)
+(* ------------------------------------------------------------------ *)
 
 program        = { function_def } ;
 
-function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" NEWLINE
-                 INDENT { statement } DEDENT ;
+function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" block ;
 
 param_list     = param { "," param } ;
 param          = IDENT ":" type ;
 type           = "int" | "float" | "str" | "bool" | "None" ;
 
+block          = NEWLINE INDENT [ STRING NEWLINE ] { statement } DEDENT ;
+                 (* a leading string literal is a docstring, not a statement *)
+
 statement      = assign_stmt
+               | aug_assign_stmt
                | if_stmt
                | while_stmt
                | for_stmt
                | return_stmt
                | print_stmt
+               | break_stmt
+               | continue_stmt
+               | pass_stmt
                | expr_stmt ;
 
-assign_stmt    = IDENT "=" expression NEWLINE ;
+assign_stmt    = IDENT [ ":" type ] "=" expression NEWLINE ;
+                 (* the annotation form pins a variable's type, e.g.
+                    `total: float = 0` so that `total = total / n` is legal *)
+
+aug_assign_stmt = IDENT aug_op expression NEWLINE ;
+aug_op         = "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" ;
 
 if_stmt        = "if" expression ":" block
                  { "elif" expression ":" block }
@@ -27,29 +45,70 @@ if_stmt        = "if" expression ":" block
 
 while_stmt     = "while" expression ":" block ;
 
-for_stmt       = "for" IDENT "in" "range" "(" expression [ "," expression ] ")" ":" block ;
+for_stmt       = "for" IDENT "in" "range" "(" expression
+                                              [ "," expression
+                                              [ "," expression ] ] ")" ":" block ;
+                 (* range(stop) | range(start, stop) | range(start, stop, step) *)
 
 return_stmt    = "return" [ expression ] NEWLINE ;
-
 print_stmt     = "print" "(" [ arg_list ] ")" NEWLINE ;
+break_stmt     = "break" NEWLINE ;
+continue_stmt  = "continue" NEWLINE ;
+pass_stmt      = "pass" NEWLINE ;
+expr_stmt      = call_expr NEWLINE ;
 
-expr_stmt      = call_expr NEWLINE ;   (* e.g. a bare function call *)
-
-block          = NEWLINE INDENT { statement } DEDENT ;
-
+(* Precedence, lowest to highest — matches CPython's. *)
 expression     = bool_or ;
 bool_or        = bool_and { "or" bool_and } ;
 bool_and       = bool_not { "and" bool_not } ;
-bool_not       = [ "not" ] comparison ;
-comparison     = arith [ ("==" | "!=" | "<" | ">" | "<=" | ">=") arith ] ;
-arith          = term { ("+" | "-") term } ;
-term           = factor { ("*" | "/" | "%") factor } ;
-factor         = [ "-" ] atom ;
-atom           = NUMBER | STRING | "True" | "False" | call_expr | IDENT | "(" expression ")" ;
+bool_not       = "not" bool_not | comparison ;
+comparison     = arith [ ( "==" | "!=" | "<" | ">" | "<=" | ">=" ) arith ] ;
+                 (* exactly one comparison: `a < b < c` is rejected, see below *)
+arith          = term { ( "+" | "-" ) term } ;
+term           = unary { ( "*" | "/" | "//" | "%" ) unary } ;
+unary          = ( "-" | "+" ) unary | power ;
+power          = atom [ "**" unary ] ;
+                 (* right-associative, and binds tighter than a unary minus on
+                    its left: -2 ** 2 is -4, and 2 ** -1 parses *)
+
+atom           = NUMBER | FLOAT | STRING
+               | "True" | "False" | "None"
+               | call_expr | IDENT | "(" expression ")" ;
 
 call_expr      = IDENT "(" [ arg_list ] ")" ;
-arg_list       = expression { "," expression } ;
+arg_list       = expression { "," expression } [ "," ] ;
 
-(* Deliberately excluded from the subset: classes, list/dict literals,
-   comprehensions, decorators, lambdas, multiple assignment, exceptions,
-   imports, string formatting. Any of these -> syntax error, by design. *)
+(* ------------------------------------------------------------------ *)
+(* Builtins with static C rules (src/semantic/builtins.py):            *)
+(*                                                                      *)
+(*   len(str) -> int          abs(x)          min(a, b, ...)            *)
+(*   max(a, b, ...)           pow(a, b)       round(x [, ndigits])      *)
+(*   int(x)  float(x)  bool(x)                                          *)
+(*                                                                      *)
+(* A call to any *other* undefined name is a compile error. With --ai   *)
+(* it is instead routed to the gate, which asks a local model for a C   *)
+(* expression and rejects the answer unless it passes a safety check    *)
+(* and compiles. That is the only place AI enters the pipeline.         *)
+(* ------------------------------------------------------------------ *)
+
+(* ------------------------------------------------------------------ *)
+(* Deliberately excluded, and rejected with a message that says so:     *)
+(*                                                                      *)
+(*   classes, lists/dicts/sets/tuples, comprehensions, slicing,         *)
+(*   decorators, lambdas, generators, exceptions, imports, closures,    *)
+(*   nested defs, global/nonlocal, multiple or chained assignment,      *)
+(*   chained comparison (a < b < c), string concatenation and           *)
+(*   formatting, default and keyword arguments, while/else, for/else.   *)
+(*                                                                      *)
+(* String concatenation and str() are excluded specifically because     *)
+(* they need heap allocation; the generated C has no allocator and no   *)
+(* ownership model, and half-implementing one would be worse than       *)
+(* saying no.                                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* Documented behavioural limits of the generated C:                    *)
+(*   - Python ints are arbitrary precision; py_int is 64-bit and wraps. *)
+(*   - Recursion depth is the C stack's, not sys.getrecursionlimit().   *)
+(*   - Everything else — /, //, %, **, round(), float repr, print       *)
+(*     formatting, zero-division errors — matches CPython exactly, and  *)
+(*     tests/test_e2e_harness.py diffs against CPython to prove it.     *)

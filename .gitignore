@@ -10,8 +10,10 @@ build/
 *.out
 out.c
 history/
-reports/ai_invocation_log.md
+reports/*
+!reports/.gitkeep
 .venv/
 venv/
 env/
+.pytest_cache/
 *.tmp

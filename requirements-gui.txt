@@ -1,1 +1,13 @@
-ttkbootstrap>=1.10.1
+# The GUI has no third-party dependencies — it is standard-library tkinter.
+#
+# Earlier versions used ttkbootstrap for theming. That was dropped: ttk widgets
+# cannot be recoloured reliably across platforms, so the interface now paints
+# itself (see the THEMES table and ThinScrollbar in gui.py) and works with a
+# stock Python install.
+#
+# You need:
+#   * Python 3.9+ with tkinter (bundled on Windows and macOS; on Debian/Ubuntu
+#     install it with `sudo apt install python3-tk`)
+#   * a C compiler on PATH to build and run the generated code
+#   * pytest, only to run the test suite:  pip install pytest
+#   * Ollama, only if you want to try the optional AI-assist path
