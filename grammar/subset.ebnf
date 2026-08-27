@@ -1,0 +1,55 @@
+(* Python-subset grammar — the source language this compiler accepts.
+   Every construct here MUST have a deterministic codegen rule.
+   Anything outside this grammar is a syntax error, not an AI job. *)
+
+program        = { function_def } ;
+
+function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" NEWLINE
+                 INDENT { statement } DEDENT ;
+
+param_list     = param { "," param } ;
+param          = IDENT ":" type ;
+type           = "int" | "float" | "str" | "bool" | "None" ;
+
+statement      = assign_stmt
+               | if_stmt
+               | while_stmt
+               | for_stmt
+               | return_stmt
+               | print_stmt
+               | expr_stmt ;
+
+assign_stmt    = IDENT "=" expression NEWLINE ;
+
+if_stmt        = "if" expression ":" block
+                 { "elif" expression ":" block }
+                 [ "else" ":" block ] ;
+
+while_stmt     = "while" expression ":" block ;
+
+for_stmt       = "for" IDENT "in" "range" "(" expression [ "," expression ] ")" ":" block ;
+
+return_stmt    = "return" [ expression ] NEWLINE ;
+
+print_stmt     = "print" "(" [ arg_list ] ")" NEWLINE ;
+
+expr_stmt      = call_expr NEWLINE ;   (* e.g. a bare function call *)
+
+block          = NEWLINE INDENT { statement } DEDENT ;
+
+expression     = bool_or ;
+bool_or        = bool_and { "or" bool_and } ;
+bool_and       = bool_not { "and" bool_not } ;
+bool_not       = [ "not" ] comparison ;
+comparison     = arith [ ("==" | "!=" | "<" | ">" | "<=" | ">=") arith ] ;
+arith          = term { ("+" | "-") term } ;
+term           = factor { ("*" | "/" | "%") factor } ;
+factor         = [ "-" ] atom ;
+atom           = NUMBER | STRING | "True" | "False" | call_expr | IDENT | "(" expression ")" ;
+
+call_expr      = IDENT "(" [ arg_list ] ")" ;
+arg_list       = expression { "," expression } ;
+
+(* Deliberately excluded from the subset: classes, list/dict literals,
+   comprehensions, decorators, lambdas, multiple assignment, exceptions,
+   imports, string formatting. Any of these -> syntax error, by design. *)
