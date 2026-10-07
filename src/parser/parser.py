@@ -168,6 +168,12 @@ class Parser:
     # ---- statements ----
 
     def parse_statement(self):
+        if self.at("INDENT"):
+            raise ParseError(
+                f"line {self.cur().line}: unexpected indent - this line is indented "
+                f"further than the one before it without an `if`, `while`, `for` or "
+                f"`def` header to open a new block"
+            )
         if self.at_kw("if"):
             return self.parse_if()
         if self.at_kw("while"):

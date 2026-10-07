@@ -905,6 +905,19 @@ class TranslationCompilerApp:
             panes, self, "Generated C", "C", readonly=True,
             actions=(("Copy", self.copy_output), ("Save .c", self.save_output)))
         panes.add(self.output_pane, minsize=320, stretch="always")
+        # Kept on the instance so the split can be repositioned (and so the
+        # two editors can be balanced on first show rather than defaulting to
+        # whatever width the source pane happened to request).
+        self.editor_panes = panes
+        self.root.after(120, self._balance_editors)
+
+    def _balance_editors(self):
+        try:
+            width = self.editor_panes.winfo_width()
+            if width > 100:
+                self.editor_panes.sash_place(0, width // 2, 1)
+        except tk.TclError:
+            pass
 
     def _build_bottom_panel(self, parent):
         tabs = self.register(tk.Frame(parent, height=40), bg="bg")
@@ -1177,6 +1190,12 @@ class TranslationCompilerApp:
     def _on_failure(self, message, results):
         self._finish()
         self.pipeline = results
+        # Clear any C left from an earlier, successful run. Leaving it on
+        # screen next to a failed translation reads as though this program
+        # produced it.
+        self.output_pane.set_text(
+            "/* No C was generated: the translation failed.\n"
+            " * See the Pipeline tab for the diagnostic. */\n")
         self._refresh_stage_chips()
         line = _line_from_message(message)
         if line:
