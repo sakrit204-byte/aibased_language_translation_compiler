@@ -1,0 +1,12 @@
+{
+  "01_pythagoras.py": "hypot, sqrt",
+  "02_trigonometry.py": "sin, cos, tan, radians",
+  "03_logarithms.py": "log, log10, log2, exp",
+  "04_navigation.py": "atan2, degrees, hypot",
+  "05_quadratic.py": "sqrt, fabs",
+  "06_statistics.py": "sqrt, erf",
+  "07_compound_growth.py": "exp, log, floor",
+  "08_waveform.py": "sin, radians, fabs",
+  "09_hyperbolic.py": "sinh, cosh, tanh",
+  "10_projectile.py": "sin, cos, radians, sqrt, atan2, degrees"
+}
