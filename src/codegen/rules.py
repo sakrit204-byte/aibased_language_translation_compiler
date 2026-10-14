@@ -133,6 +133,8 @@ class CodegenRules:
         if isinstance(node, A.Bool):
             return "1" if node.value else "0"
         if isinstance(node, A.Name):
+            if node.member is not None:          # a module constant: math.pi
+                return node.member.render([])
             return c_name(node.id)
         if isinstance(node, A.BinOp):
             return self.binop(node)
@@ -233,6 +235,11 @@ class CodegenRules:
             return f"{self.func_name(node.name)}({', '.join(args)})"
         if node.kind == "builtin":
             return self.builtin(node, args, types)
+        if node.kind == "module":
+            # The C expression comes from semantic/modules.py, which owns both
+            # the type rule and the translation, so there is nothing to decide
+            # here and nothing for the AI gate to be asked.
+            return node.member.render(args)
         if node.kind == "ai":
             return self.ai_call(node, args)
         raise CodegenError(

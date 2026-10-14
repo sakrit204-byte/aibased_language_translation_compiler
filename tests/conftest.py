@@ -66,8 +66,10 @@ def read_program(filename):
 def python_ground_truth(filename):
     """Run a sample under CPython and return its stdout.
 
-    Programs named ai_* call functions that live in `math`, which this subset
-    has no import syntax for, so the preamble is supplied here.
+    Programs under ai/ call maths functions bare — `sqrt(x)` with no import —
+    which is what makes them AI-eligible, so the oracle is given the import
+    they deliberately leave out. A program that imports `math` itself needs
+    no help here; see programs/imports_math.py.
     """
     source = read_program(filename)
     # put() is a compiler builtin with no CPython equivalent — print always

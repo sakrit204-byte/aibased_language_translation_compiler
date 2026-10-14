@@ -30,8 +30,9 @@ USER_MAIN = "py_user_main"
 
 
 class Emitter:
-    def __init__(self, symtab, ai_resolver=None):
+    def __init__(self, symtab, ai_resolver=None, profiles=()):
         self.symtab = symtab
+        self.profiles = list(profiles)
         self.needs = set()
         self.ai_call_sites = 0
         self._tmp = 0
@@ -73,6 +74,8 @@ class Emitter:
         decls = [self._signature(fn) + ";" for fn in program.functions]
 
         parts = [prelude_for(self.needs)]
+        if self.profiles:
+            parts.append(self._emit_profile_decls())
         if decls:
             parts.append("\n/* ---- forward declarations (any call order, including recursion) ---- */\n")
             parts.append("\n".join(decls) + "\n")
@@ -81,6 +84,23 @@ class Emitter:
             parts.append("\n" + body + "\n")
         parts.append("\n" + self._emit_entry_point(program))
         return "".join(parts)
+
+    def _emit_profile_decls(self) -> str:
+        """Declare the C shim functions an import brought into scope.
+
+        These are declared inline rather than via #include so the generated
+        .c stays self-contained — the same reason the runtime prelude is
+        inlined. Only the linker needs to know where the shim lives.
+        """
+        out = []
+        for profile in self.profiles:
+            out.append(
+                f"\n/* ---- {profile.name}: implemented in "
+                f"{', '.join(profile.link_sources)} ---- */\n"
+            )
+            for name in sorted(profile.functions):
+                out.append(profile.functions[name] + "\n")
+        return "".join(out)
 
     def _emit_entry_point(self, program: A.Program) -> str:
         main = next((fn for fn in program.functions if fn.name == "main"), None)

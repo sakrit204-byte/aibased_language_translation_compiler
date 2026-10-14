@@ -9,7 +9,31 @@
 (* itself is the correctness oracle for the generated C.                *)
 (* ------------------------------------------------------------------ *)
 
-program        = { function_def } ;
+program        = { import_stmt | function_def } ;
+
+(* ------------------------------------------------------------------ *)
+(* An import binds names; it never executes a module. There is no      *)
+(* module object, nothing to run at import time and no file to read —  *)
+(* the name is looked up in a fixed table (src/semantic/modules.py)    *)
+(* and each member it brings in has a static C translation, the same   *)
+(* contract as a builtin.                                              *)
+(*                                                                     *)
+(* Two modules exist. `math` maps onto <math.h>; importing it is also  *)
+(* what makes `sqrt(x)` deterministic instead of AI-resolved. `gfx` is *)
+(* the window/OpenGL shim in src/runtime/gfx.c, and importing it is    *)
+(* what links that file in.                                            *)
+(*                                                                     *)
+(* Any other module is rejected by name with the reason. pygame and    *)
+(* numpy fail because their APIs return objects and arrays, which this *)
+(* subset has no way to hold — not because of the import syntax.       *)
+(* ------------------------------------------------------------------ *)
+
+import_stmt    = "import" dotted_name [ "as" IDENT ] NEWLINE
+               | "from" dotted_name "import" ( "*" | import_list ) NEWLINE ;
+
+import_list    = import_item { "," import_item } ;
+import_item    = IDENT [ "as" IDENT ] ;
+dotted_name    = IDENT { "." IDENT } ;
 
 function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" block ;
 
@@ -73,9 +97,15 @@ power          = atom [ "**" unary ] ;
 
 atom           = NUMBER | FLOAT | STRING
                | "True" | "False" | "None"
-               | call_expr | IDENT | "(" expression ")" ;
+               | call_expr | module_const | IDENT | "(" expression ")" ;
 
-call_expr      = IDENT "(" [ arg_list ] ")" ;
+call_expr      = [ IDENT "." ] IDENT "(" [ arg_list ] ")" ;
+                 (* the qualified form is only valid on an imported module *)
+
+module_const   = IDENT "." IDENT ;
+                 (* math.pi and friends. A dot is legal only on a name an  *)
+                 (* import bound; on anything else it is attribute access, *)
+                 (* which this subset cannot express.                      *)
 arg_list       = expression { "," expression } [ "," ] ;
 
 (* ------------------------------------------------------------------ *)

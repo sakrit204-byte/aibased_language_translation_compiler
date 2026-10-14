@@ -129,15 +129,26 @@ def exe_suffix() -> str:
     return ".exe" if sys.platform == "win32" else ""
 
 
-def compile_command(cc: str, c_path: str, out_path: str) -> list:
-    """Build the argv that turns one .c file into an executable.
+def compile_command(cc: str, c_path: str, out_path: str,
+                    extra_sources=(), extra_flags=()) -> list:
+    """Build the argv that turns the generated .c into an executable.
 
-    The generated C is deliberately self-contained (the runtime prelude is
-    inlined by the emitter), so no -I include path is ever needed.
+    The generated C is deliberately self-contained (the runtime prelude and
+    any shim declarations are inlined by the emitter), so no -I include path
+    is ever needed. `extra_sources` and `extra_flags` come from the profile an
+    import activated — see semantic/modules.py — and are the only reason this
+    ever compiles more than one file.
     """
+    extra_sources = list(extra_sources)
+    extra_flags = list(extra_flags)
     if is_msvc(cc):
-        return [cc, "/nologo", "/W3", c_path, f"/Fe:{out_path}"]
-    return [cc, "-std=c99", "-O2", c_path, "-lm", "-o", out_path]
+        # MSVC wants bare library names, not -l.
+        libs = [f.removeprefix("-l") + ".lib" for f in extra_flags if f.startswith("-l")]
+        rest = [f for f in extra_flags if not f.startswith("-l")]
+        return ([cc, "/nologo", "/W3", c_path] + extra_sources
+                + [f"/Fe:{out_path}"] + (["/link"] + libs if libs else []) + rest)
+    return ([cc, "-std=c99", "-O2", c_path] + extra_sources
+            + ["-lm"] + extra_flags + ["-o", out_path])
 
 
 def syntax_only_command(cc: str, c_path: str) -> list:

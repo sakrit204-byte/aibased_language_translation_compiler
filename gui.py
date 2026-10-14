@@ -694,6 +694,11 @@ class TranslationCompilerApp:
         self.history = []
         self.busy = False
         self.c_compiler = find_c_compiler()
+        # Set by the last successful translation. A program that imports gfx
+        # has to be linked against src/runtime/gfx.c, and Run C builds from
+        # the text in the output pane, which does not say so by itself.
+        self.last_link = {"sources": [], "flags": []}
+        self.last_source = ""
 
         # A model name saved by an older build may no longer be valid — the
         # project moved from Ollama to OpenRouter, and sending "qwen2.5-coder:7b"
@@ -1226,7 +1231,7 @@ class TranslationCompilerApp:
         self._extract("c", code)
 
     def _extract(self, kind, code):
-        from src.export import export_c, export_python
+        from src.export import export_c, export_python, required_profiles
 
         destination = filedialog.askdirectory(
             title=f"Choose where to create the {'Python' if kind == 'python' else 'C'} "
@@ -1241,7 +1246,10 @@ class TranslationCompilerApp:
             if kind == "python":
                 report = export_python(code, destination, f"{name}_python")
             else:
-                report = export_c(code, destination, f"{name}_c")
+                # Asked of the compiler's semantic phase, so the bundle
+                # cannot disagree with what Run C just linked.
+                report = export_c(code, destination, f"{name}_c",
+                                  profiles=required_profiles(self.last_source))
         except OSError as error:
             self._write_terminal(f"extract failed: {error}\n", "err")
             self.set_status("Extract failed", "err")
@@ -1351,6 +1359,8 @@ class TranslationCompilerApp:
     def _on_success(self, c_code, stats, results, source):
         self._finish()
         self.pipeline = results
+        self.last_link = results.get("link") or {"sources": [], "flags": []}
+        self.last_source = source
         self.output_pane.set_text(c_code)
         self._refresh_stage_chips()
         self.show_stage("codegen")
@@ -1702,8 +1712,12 @@ class TranslationCompilerApp:
             self._write_terminal(install_hint() + "\n", "err")
             return
         self.show_tab("terminal")
-        self._write_terminal(
-            f"$ {os.path.basename(self.c_compiler)} prog.c -lm -o prog && ./prog\n", "cmd")
+        shown = " ".join(
+            [os.path.basename(self.c_compiler), "prog.c"]
+            + [os.path.basename(p) for p in self.last_link.get("sources", ())]
+            + ["-lm"] + list(self.last_link.get("flags", ()))
+            + ["-o", "prog"])
+        self._write_terminal(f"$ {shown} && ./prog\n", "cmd")
         threading.Thread(target=self._run_c_worker, args=(code,), daemon=True).start()
 
     def _run_c_worker(self, code):
@@ -1715,7 +1729,9 @@ class TranslationCompilerApp:
                     f.write(code)
                 env = run_env(self.c_compiler)
                 build = subprocess.run(
-                    compile_command(self.c_compiler, c_path, bin_path),
+                    compile_command(self.c_compiler, c_path, bin_path,
+                                    extra_sources=self.last_link.get("sources", ()),
+                                    extra_flags=self.last_link.get("flags", ())),
                     capture_output=True, text=True, env=env, cwd=tmp, timeout=120)
                 if build.returncode != 0:
                     detail = build.stderr or build.stdout or "(no diagnostics)"

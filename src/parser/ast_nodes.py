@@ -6,7 +6,7 @@ not something to paper over with a default, because a wrong type here becomes
 a silently wrong value in the generated C.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------- structure
@@ -14,6 +14,25 @@ from dataclasses import dataclass
 @dataclass
 class Program:
     functions: list
+    imports: list = field(default_factory=list)
+
+
+@dataclass
+class Import:
+    """One import statement.
+
+    `import math`            -> module="math", alias=None,  members=None
+    `import math as m`       -> module="math", alias="m",   members=None
+    `from math import sqrt`  -> module="math", members=[("sqrt", "sqrt")]
+    `from math import *`     -> module="math", members=None, star=True
+
+    An import binds names; it never runs anything. See semantic/modules.py.
+    """
+    module: str
+    line: int
+    alias: str = None
+    members: list = None      # list[(member_name, local_name)]
+    star: bool = False
 
 
 @dataclass
@@ -153,8 +172,9 @@ class Call:
     args: list
     line: int
     inferred_type: str = None
-    kind: str = None          # "user" | "builtin" | "ai"
+    kind: str = None          # "user" | "builtin" | "module" | "ai"
     ai_expr: str = None       # the validated C expression, when kind == "ai"
+    member: object = None     # modules.Member, when kind == "module"
 
 
 @dataclass
@@ -162,6 +182,7 @@ class Name:
     id: str
     line: int
     inferred_type: str = None
+    member: object = None     # modules.Member, for a module constant (math.pi)
 
 
 @dataclass

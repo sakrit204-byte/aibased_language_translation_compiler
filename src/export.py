@@ -118,6 +118,25 @@ def needs_math_import(source):
         return False
 
 
+def required_profiles(source):
+    """The C shims this program's imports pull in, e.g. the gfx window layer.
+
+    Asked of the compiler's own semantic phase, so the export cannot disagree
+    with what the compiler decided to link.
+    """
+    try:
+        from .lexer.lexer import Lexer
+        from .parser.parser import Parser
+        from .semantic.type_checker import TypeChecker
+
+        ast = Parser(Lexer(source).tokenize()).parse_program()
+        checker = TypeChecker(ai_enabled=True)
+        checker.check(ast)
+        return list(checker.profiles)
+    except Exception:
+        return []
+
+
 def uses_builtin(source, name):
     """True if `source` calls the named builtin. Determined by walking the
     parsed program rather than searching the text, so a mention in a comment
@@ -151,16 +170,18 @@ def runnable_python(source):
     Three things are missing from a subset program on its own, and without all
     three `python program.py` either crashes or silently does nothing:
 
-      * the maths functions, which the subset has no import syntax for;
+      * the maths functions, if the program calls them bare — `sqrt(x)` with
+        no import, which is what makes a call AI-eligible. A program that
+        says `import math` itself needs nothing added here;
       * `put`, which is a compiler builtin with no CPython equivalent;
       * a call to main(), because the compiler synthesises C's entry point and
         the source itself only ever defines functions.
     """
     parts = []
     if needs_math_import(source):
-        parts.append("# These live in Python's math module. The compiler has no\n"
-                     "# import syntax, so the translator asks the model for a C\n"
-                     "# equivalent; CPython just needs the import.\n"
+        parts.append("# This program calls these bare, with no import, which is\n"
+                     "# what sends them to the AI gate for a C translation.\n"
+                     "# CPython just needs the import.\n"
                      "from math import *\n\n")
     if uses_builtin(source, "put"):
         parts.append("# put() is a compiler builtin: it writes a string with no\n"
@@ -202,7 +223,7 @@ def _python_sh():
     )
 
 
-def _c_bat(compiler_path, binary):
+def _c_bat(compiler_path, binary, extra_sources=(), extra_flags=()):
     """Windows launcher. Reuses the pre-built binary when it is there, and
     otherwise builds with the compiler this export was made with."""
     directory = os.path.dirname(compiler_path) if compiler_path else ""
@@ -228,7 +249,8 @@ def _c_bat(compiler_path, binary):
         "  pause\r\n"
         "  exit /b 1\r\n",
         ")\r\n",
-        f'%CC% -std=c99 -O2 program.c -lm -o {binary}\r\n',
+        f'%CC% -std=c99 -O2 program.c{_joined(extra_sources)} -lm'
+        f'{_joined(extra_flags)} -o {binary}\r\n',
         "if errorlevel 1 (\r\n",
         "  echo Build failed.\r\n",
         "  pause\r\n",
@@ -247,7 +269,11 @@ def _c_bat(compiler_path, binary):
     return "".join(lines)
 
 
-def _c_sh():
+def _joined(items):
+    return "".join(" " + item for item in items)
+
+
+def _c_sh(extra_sources=(), extra_flags=()):
     return (
         "#!/bin/sh\n"
         'cd "$(dirname "$0")" || exit 1\n'
@@ -258,7 +284,8 @@ def _c_sh():
         "    command -v \"$c\" >/dev/null 2>&1 && { CC=\"$c\"; break; }\n"
         "  done\n"
         '  [ -z "$CC" ] && { echo "No C compiler found."; exit 1; }\n'
-        '  "$CC" -std=c99 -O2 program.c -lm -o program || exit 1\n'
+        f'  "$CC" -std=c99 -O2 program.c{_joined(extra_sources)} -lm'
+        f'{_joined(extra_flags)} -o program || exit 1\n'
         "fi\n"
         "echo '=== Running ==='\n"
         "echo\n"
@@ -291,12 +318,40 @@ def export_python(source, destination, folder_name="python_export"):
             "files": sorted(os.listdir(target))}
 
 
-def export_c(source_c, destination, folder_name="c_export", build=True):
-    """Write a runnable C bundle, pre-building the binary when possible."""
+def export_c(source_c, destination, folder_name="c_export", build=True,
+             profiles=()):
+    """Write a runnable C bundle, pre-building the binary when possible.
+
+    `profiles` are the C shims an import activated (see semantic/modules.py).
+    Their .c files are copied in beside program.c, so the exported folder
+    stays self-contained and the launcher can rebuild it anywhere.
+    """
     target = _unique_dir(destination, folder_name)
     os.makedirs(target)
 
     _write(os.path.join(target, "program.c"), source_c)
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    shim_sources, shim_flags = [], []
+    for profile in profiles:
+        for rel in profile.link_sources:
+            origin = os.path.join(root, rel.replace("/", os.sep))
+            name = os.path.basename(origin)
+            try:
+                with open(origin, "r", encoding="utf-8") as f:
+                    _write(os.path.join(target, name), f.read())
+            except OSError:
+                continue
+            # The header too, when the shim has one: the .c includes it.
+            header = os.path.splitext(origin)[0] + ".h"
+            if os.path.exists(header):
+                with open(header, "r", encoding="utf-8") as f:
+                    _write(os.path.join(target, os.path.basename(header)), f.read())
+            if name not in shim_sources:
+                shim_sources.append(name)
+        for flag in profile.link_flags:
+            if flag not in shim_flags:
+                shim_flags.append(flag)
 
     compiler = find_c_compiler()
     binary_name = "program" + exe_suffix()
@@ -308,7 +363,9 @@ def export_c(source_c, destination, folder_name="c_export", build=True):
         c_path = os.path.join(target, "program.c")
         try:
             result = subprocess.run(
-                compile_command(compiler, c_path, binary_path),
+                compile_command(compiler, c_path, binary_path,
+                                extra_sources=shim_sources,
+                                extra_flags=shim_flags),
                 capture_output=True, text=True, cwd=target,
                 env=run_env(compiler), timeout=120)
             built = result.returncode == 0 and os.path.exists(binary_path)
@@ -325,8 +382,10 @@ def export_c(source_c, destination, folder_name="c_export", build=True):
                 except OSError:
                     pass
 
-    _write(os.path.join(target, "run.bat"), _c_bat(compiler, binary_name))
-    _write(os.path.join(target, "run.sh"), _c_sh(), executable=True)
+    _write(os.path.join(target, "run.bat"),
+           _c_bat(compiler, binary_name, shim_sources, shim_flags))
+    _write(os.path.join(target, "run.sh"),
+           _c_sh(shim_sources, shim_flags), executable=True)
 
     if built:
         extra = ("\n    A pre-built binary is included, so run.bat runs it\n"

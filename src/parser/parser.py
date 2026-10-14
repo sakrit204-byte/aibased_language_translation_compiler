@@ -35,6 +35,10 @@ class Parser:
     def __init__(self, tokens):
         self.tokens = tokens
         self.pos = 0
+        # Aliases bound by an `import` seen so far. The parser needs these
+        # because a dot is only legal after one of them: `math.sqrt` is a
+        # module member, `point.x` is attribute access and still rejected.
+        self.module_aliases = set()
 
     # ---- token helpers ----
 
@@ -77,21 +81,98 @@ class Parser:
 
     def parse_program(self):
         funcs = []
+        imports = []
         while not self.at("EOF"):
             if self.at("NEWLINE"):        # stray blank logical line
                 self.take()
                 continue
+            if self.at_kw("import") or self.at_kw("from"):
+                imports.append(self.parse_import())
+                continue
             if not self.at_kw("def"):
                 t = self.cur()
                 raise ParseError(
-                    f"line {t.line}: only function definitions are allowed at module level "
-                    f"in this subset, found {t.kind} {t.value!r}. Move top-level code into "
-                    f"a function (for example `def main() -> int:`)."
+                    f"line {t.line}: only imports and function definitions are allowed at "
+                    f"module level in this subset, found {t.kind} {t.value!r}. Move top-level "
+                    f"code into a function (for example `def main() -> int:`)."
                 )
             funcs.append(self.parse_function())
         if not funcs:
             raise ParseError("empty program: define at least one function")
-        return A.Program(funcs)
+        return A.Program(funcs, imports)
+
+    # ---- imports ----
+
+    def parse_import(self):
+        """`import m [as a]` or `from m import x [as y], ... | *`.
+
+        Only the shape is checked here. Whether the module exists and whether
+        it has the named members is semantic/modules.py's job, so that the
+        error can explain what a module is and is not able to offer.
+        """
+        if self.at_kw("import"):
+            line = self.eat("KEYWORD", "import").line
+            module = self.parse_dotted_name()
+            alias = None
+            if self.at_kw("as"):
+                self.eat("KEYWORD", "as")
+                alias = self.eat("NAME").value
+            if self.at("COMMA"):
+                raise ParseError(
+                    f"line {line}: import one module per line in this subset "
+                    f"(`import a, b` is not accepted)"
+                )
+            self.end_logical_line("import")
+            self.module_aliases.add(alias or module.split(".")[0])
+            return A.Import(module, line, alias=alias)
+
+        line = self.eat("KEYWORD", "from").line
+        module = self.parse_dotted_name()
+        if not self.at_kw("import"):
+            t = self.cur()
+            raise ParseError(
+                f"line {line}: expected `import` after `from {module}`, found "
+                f"{t.kind} {t.value!r}"
+            )
+        self.eat("KEYWORD", "import")
+
+        if self.at("STAR"):
+            self.eat("STAR")
+            self.end_logical_line("import")
+            return A.Import(module, line, members=None, star=True)
+
+        members = []
+        while True:
+            name = self.eat("NAME").value
+            local = name
+            if self.at_kw("as"):
+                self.eat("KEYWORD", "as")
+                local = self.eat("NAME").value
+            members.append((name, local))
+            if not self.at("COMMA"):
+                break
+            self.eat("COMMA")
+        self.end_logical_line("import")
+        return A.Import(module, line, members=members)
+
+    def parse_dotted_name(self):
+        """A module path: `math`, or `pygame.locals`."""
+        parts = [self.eat("NAME").value]
+        while self.at("DOT"):
+            self.eat("DOT")
+            parts.append(self.eat("NAME").value)
+        return ".".join(parts)
+
+    def end_logical_line(self, what):
+        if self.at("NEWLINE"):
+            self.take()
+            return
+        if self.at("EOF"):
+            return
+        t = self.cur()
+        raise ParseError(
+            f"line {t.line}: unexpected {t.kind} {t.value!r} at the end of the {what}"
+        )
 
     def parse_function(self):
         line = self.eat("KEYWORD", "def").line
@@ -422,6 +503,8 @@ class Parser:
                 self.pos += 1
                 return A.NoneLit(t.line)
         if t.kind == "NAME":
+            if self.nxt().kind == "DOT":
+                return self.parse_module_access()
             if self.nxt().kind == "LPAREN":
                 return self.parse_call()
             self.pos += 1
@@ -435,6 +518,52 @@ class Parser:
             return expr
         raise ParseError(f"line {t.line}: unexpected token {t.kind} {t.value!r}")
 
+    def parse_module_access(self):
+        """`math.sqrt(x)` or `math.pi`.
+
+        A dot is accepted only on a name an `import` bound. Anything else is
+        attribute access on a value, which this subset has no way to
+        represent, so it keeps the error it always had.
+        """
+        owner = self.eat("NAME")
+        if owner.value not in self.module_aliases:
+            self.eat("DOT")
+            member = self.cur().value if self.at("NAME") else "?"
+            raise ParseError(
+                f"line {owner.line}: '{owner.value}.{member}' is attribute access on a "
+                f"value, which is not part of this Python subset — there are no objects "
+                f"here to hold a field.\n"
+                f"  A dot is only valid on an imported module, e.g. "
+                f"`import math` then `math.sqrt(x)`."
+            )
+        self.eat("DOT")
+        member_tok = self.eat("NAME")
+        canonical = f"{owner.value}.{member_tok.value}"
+
+        if self.at("DOT"):
+            raise ParseError(
+                f"line {owner.line}: '{canonical}.…' goes a level deeper than this subset "
+                f"allows; a module member is a function or a number, not an object"
+            )
+        if not self.at("LPAREN"):
+            return A.Name(canonical, member_tok.line)
+        args = self.parse_arguments()
+        return A.Call(canonical, args, member_tok.line)
+
+    def parse_arguments(self):
+        """The `( ... )` of a call. Shared by plain and module calls."""
+        self.eat("LPAREN")
+        args = []
+        if not self.at("RPAREN"):
+            args.append(self.parse_expression())
+            while self.at("COMMA"):
+                self.eat("COMMA")
+                if self.at("RPAREN"):        # trailing comma
+                    break
+                args.append(self.parse_expression())
+        self.eat("RPAREN")
+        return args
+
     def parse_call(self):
         name_tok = self.eat("NAME")
         if name_tok.value == "print":
@@ -446,14 +575,5 @@ class Parser:
             raise ParseError(
                 f"line {name_tok.line}: range() may only appear in a `for` header in this subset"
             )
-        self.eat("LPAREN")
-        args = []
-        if not self.at("RPAREN"):
-            args.append(self.parse_expression())
-            while self.at("COMMA"):
-                self.eat("COMMA")
-                if self.at("RPAREN"):        # trailing comma
-                    break
-                args.append(self.parse_expression())
-        self.eat("RPAREN")
+        args = self.parse_arguments()
         return A.Call(name_tok.value, args, name_tok.line)

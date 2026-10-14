@@ -101,7 +101,7 @@ def compile_source_detailed(source, use_ai=False, model=None, log_path=None,
         gate = Gate(model=model, log_path=log_path, cache_path=cache_path)
         resolver = gate.resolve
 
-    emitter = Emitter(symtab, ai_resolver=resolver)
+    emitter = Emitter(symtab, ai_resolver=resolver, profiles=checker.profiles)
     try:
         c_code = emitter.emit_program(ast)
     except (CodegenError, AIAssistError) as e:
@@ -119,8 +119,11 @@ def compile_source_detailed(source, use_ai=False, model=None, log_path=None,
     }
     results["stages"]["ai_gate"] = _gate_stage(use_ai, gate, emitter)
     results["c_code"] = c_code
+    results["profiles"] = [p.name for p in checker.profiles]
+    results["link"] = link_requirements(checker.profiles)
 
     stats = {
+        "imports": [p.name for p in checker.profiles],
         "ai_calls_used": emitter.ai_call_sites,
         "total_call_sites": checker.call_sites,
         "ai_enabled": use_ai,
@@ -129,6 +132,25 @@ def compile_source_detailed(source, use_ai=False, model=None, log_path=None,
         "runtime_helpers": len(emitter.needs),
     }
     return c_code, stats, results
+
+
+def link_requirements(profiles):
+    """The extra .c files and linker flags the activated profiles need.
+
+    Paths are resolved against the project root so this works regardless of
+    the caller's working directory.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sources, flags = [], []
+    for profile in profiles:
+        for rel in profile.link_sources:
+            path = os.path.join(root, rel.replace("/", os.sep))
+            if path not in sources:
+                sources.append(path)
+        for flag in profile.link_flags:
+            if flag not in flags:
+                flags.append(flag)
+    return {"sources": sources, "flags": flags}
 
 
 def _gate_stage(use_ai, gate, emitter):
@@ -165,7 +187,7 @@ def ast_to_dict(node):
 
 # --------------------------------------------------------------------- build
 
-def build_and_run(c_code, argv=(), timeout=30):
+def build_and_run(c_code, argv=(), timeout=30, link=None):
     """Compile `c_code` with the detected C compiler and run it.
 
     Returns (returncode, stdout, stderr). Raises ToolchainError if there is no
@@ -182,7 +204,9 @@ def build_and_run(c_code, argv=(), timeout=30):
             f.write(c_code)
         env = run_env(cc)
         build = subprocess.run(
-            compile_command(cc, c_path, bin_path),
+            compile_command(cc, c_path, bin_path,
+                            extra_sources=(link or {}).get("sources", ()),
+                            extra_flags=(link or {}).get("flags", ())),
             capture_output=True, text=True, cwd=tmp, timeout=timeout, env=env,
         )
         if build.returncode != 0:
@@ -234,7 +258,7 @@ def main(argv=None):
         return 2
 
     try:
-        c_code, stats = compile_source(
+        c_code, stats, results = compile_source_detailed(
             source, use_ai=use_ai, model=args.model,
             log_path=args.ai_log, cache_path=args.ai_cache,
         )
@@ -267,10 +291,13 @@ def main(argv=None):
         f"model queries: {stats['ai_queries']}"
         + ("" if use_ai else "   (AI-assist disabled)")
     )
+    if stats.get("imports"):
+        print(f"linking shims: {', '.join(stats['imports'])}")
 
     if args.run:
         try:
-            code, out_text, err_text = build_and_run(c_code)
+            code, out_text, err_text = build_and_run(
+                c_code, link=results.get("link"))
         except ToolchainError as e:
             print(f"\ncannot run: {e}", file=sys.stderr)
             return 3

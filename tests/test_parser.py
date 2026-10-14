@@ -121,7 +121,7 @@ def test_trailing_comma_in_a_call():
     ("def f() -> int:\n    return (1, 2)\n", "tuples"),
     ("def f(x) -> int:\n    return x\n", "needs a type annotation"),
     ("def f():\n    return 1\n", "explicit return-type annotation"),
-    ("x = 1\n", "only function definitions are allowed at module level"),
+    ("x = 1\n", "allowed at module level"),
     ("def f() -> None:\n    def g() -> None:\n        pass\n", "nested function"),
     ("def f() -> None:\n    for x in y:\n        pass\n", "only iterate over range"),
     ("def f() -> None:\n    x = print(1)\n", "only be used as a statement"),

@@ -11,6 +11,7 @@ KEYWORDS = {
     "def", "return", "if", "elif", "else", "while", "for", "in",
     "and", "or", "not", "True", "False", "None",
     "break", "continue", "pass",
+    "import", "from", "as",
 }
 
 # Names that are valid as a type annotation.

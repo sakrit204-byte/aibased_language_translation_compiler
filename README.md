@@ -220,10 +220,14 @@ Standard-library tkinter only; no third-party packages.
 ## What's out of scope
 
 Classes, lists/dicts/sets/tuples, comprehensions, slicing, decorators, lambdas,
-generators, exceptions, imports, closures, nested functions, chained assignment
-and comparison, default and keyword arguments, string concatenation and
+generators, exceptions, closures, nested functions, chained assignment and
+comparison, default and keyword arguments, string concatenation and
 formatting. These are rejected by the grammar with a message that says so, not
 silently mishandled.
+
+Imports are accepted, but only for the two modules in
+`src/semantic/modules.py` — see below. Anything else is refused by name with
+the reason.
 
 String concatenation and `str()` are excluded specifically because they need
 heap allocation, and the generated C has no allocator or ownership model.
@@ -234,6 +238,81 @@ hidden: Python integers are arbitrary precision while `py_int` is 64-bit and
 wraps, and recursion depth is the C stack's rather than
 `sys.getrecursionlimit()`. Everything else matches CPython exactly, and the
 tests prove it by diffing against CPython.
+
+## Imports
+
+An import here binds names. It does not execute a module, because there is no
+module object to execute and no file to go and read: the name is looked up in
+a fixed table, and every member it brings into scope has a static type rule
+and a static C translation — the same contract as a builtin.
+
+```python
+import math
+from math import sqrt, floor
+from math import degrees as to_degrees
+import math as m
+from math import *
+```
+
+Two modules exist.
+
+**`math`** maps onto `<math.h>`: 33 names, including the places where Python
+and C disagree. `math.floor` returns an `int` as Python's does, not the
+`double` C's `floor` hands back. Importing it also makes the maths
+*deterministic* — a bare `sqrt(x)` has no rule and costs a model round trip
+that comes back proven only to compile, whereas `math.sqrt` is known-correct
+here and never reaches the gate:
+
+```
+$ python -m src.driver tests/programs/imports_math.py --run
+call sites: 31   AI-resolved: 0   model queries: 0   (AI-assist disabled)
+```
+
+**`gfx`** is the window and OpenGL shim in `src/runtime/gfx.c`, and importing
+it is what links that file in. It is the one way a program in this subset can
+open a window, and it works only because every function in it takes and
+returns numbers — the shim owns the window handle, the GL context and the
+keyboard, none of which the subset can express:
+
+```python
+import gfx
+import math
+
+def main() -> int:
+    if gfx.open(900, 650) == 0:
+        return 1
+    while gfx.running() != 0:
+        gfx.poll()
+        gfx.clear(0.07, 0.08, 0.11)
+        gfx.perspective(60.0, 0.1, 100.0)
+        gfx.camera(math.cos(gfx.time()) * 6.0, 3.0, math.sin(gfx.time()) * 6.0,
+                   0.0, 0.0, 0.0)
+        gfx.color(0.9, 0.3, 0.25)
+        gfx.tri(-1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.5, 0.0)
+        gfx.present()
+    gfx.close()
+    return 0
+```
+
+`demos/cube3d.py` is a fuller version of that — a lit, rotating cube in a
+real window, with arrow-key camera control.
+
+**Everything else is refused by name, with the reason.** The reason is never
+the import syntax; it is that the module's API hands back something the subset
+has no way to hold:
+
+```
+$ python -m src.driver rubik.py
+line 1: 'pygame' cannot be imported — its API is built from objects and
+arrays, and this subset has neither, so there is no way to hold what it would
+hand back. For a window, use `import gfx` instead.
+  Importable here: gfx, math.
+```
+
+`random` is refused for a different and more interesting reason: it *could* be
+translated, but C's `rand()` is not Python's Mersenne Twister, so the compiled
+program would print different numbers from the Python one — and agreeing with
+CPython exactly is how this compiler is tested.
 
 ## Evaluation
 

@@ -138,25 +138,40 @@ def test_dedent_to_an_unknown_level_is_an_error():
     "import pygame\n",
     "import math\n",
     "from math import sqrt, sin\n",
+    "import math as m\n",
 ])
-def test_imports_are_reported_as_imports_not_as_a_stray_dot(source):
-    """Scanning `from pygame.locals import *` left to right, the first thing
-    that breaks is the dot — true, but not the point. The error has to name
-    the import."""
-    with pytest.raises(LexError) as excinfo:
-        Lexer(source).tokenize()
-    message = str(excinfo.value)
-    assert "no imports" in message
-    assert "attribute access" not in message
+def test_an_import_lexes(source):
+    """The lexer no longer judges imports. Whether a module can be honoured
+    is semantic/modules.py's decision, because only it knows what each module
+    would have to hand back. Here the line just has to tokenize."""
+    toks = Lexer(source).tokenize()
+    assert toks[0].kind == "KEYWORD"
+    assert toks[0].value in ("import", "from")
 
 
-def test_import_as_an_ordinary_name_is_still_allowed():
-    """Only a line that *starts* with import or from is an import. The words
-    are not keywords in this subset, so they remain usable as names."""
+def test_import_from_and_as_are_keywords_now():
+    toks = Lexer("from math import sqrt as s\n").tokenize()
+    kinds = {(t.kind, t.value) for t in toks}
+    assert ("KEYWORD", "from") in kinds
+    assert ("KEYWORD", "import") in kinds
+    assert ("KEYWORD", "as") in kinds
+
+
+def test_a_name_that_merely_starts_with_import_is_still_a_name():
+    """Only the exact word is a keyword, so `import_count` is unaffected."""
     toks = Lexer("def f() -> int:\n    import_count = 1\n    return import_count\n").tokenize()
     assert any(t.kind == "NAME" and t.value == "import_count" for t in toks)
 
 
-def test_a_real_attribute_access_still_says_attribute_access():
-    with pytest.raises(LexError, match="attribute access"):
-        Lexer("def f() -> int:\n    return obj.field\n").tokenize()
+def test_a_dot_is_a_token_now():
+    """`.` reaches the parser, which has the context to tell `math.sqrt` from
+    `obj.field`. See tests/test_imports.py for the resulting errors."""
+    toks = Lexer("def f() -> int:\n    return obj.field\n").tokenize()
+    assert any(t.kind == "DOT" for t in toks)
+
+
+def test_a_float_literal_is_not_split_on_its_dot():
+    for source, expected in (("x = 3.5\n", "3.5"), ("x = .5\n", ".5"), ("x = 2.\n", "2.")):
+        toks = Lexer(source).tokenize()
+        assert any(t.kind == "FLOAT" and t.value == expected for t in toks), source
+        assert not any(t.kind == "DOT" for t in toks), source

@@ -34,6 +34,7 @@ can route it through the gate. See src/ai_assist/gate.py.
 
 from ..parser import ast_nodes as A
 from .symbol_table import SymbolTable, SemanticError
+from . import modules
 from .builtins import (
     BUILTINS, BuiltinError, assignable, check_call, is_numeric, join,
     power_result_type, promote,
@@ -55,6 +56,13 @@ class TypeChecker:
     def __init__(self, ai_enabled: bool = False):
         self.symtab = SymbolTable()
         self.ai_enabled = ai_enabled
+        # Filled by _check_imports. `module_aliases` serves `math.sqrt`,
+        # `imported` serves the plain `sqrt` a from-import binds, and
+        # `profiles` is the set of C shims this program must be linked
+        # against, which the driver reads back off the checker.
+        self.module_aliases = {}        # alias -> modules.Module
+        self.imported = {}              # local name -> (Module, Member)
+        self.profiles = []              # profiles.Profile, in import order
         self.ai_calls = []          # Call nodes tagged kind="ai", in source order
         self.call_sites = 0         # every call site, for an honest AI-usage rate
         self.env = {}
@@ -66,6 +74,8 @@ class TypeChecker:
     # ---------------------------------------------------------------- driver
 
     def check(self, program: A.Program):
+        self._check_imports(program)
+
         for fn in program.functions:
             if fn.name in RESERVED_NAMES:
                 raise SemanticError(
@@ -79,6 +89,82 @@ class TypeChecker:
 
         self._check_entry_point(program)
         return self.symtab
+
+    def _check_imports(self, program):
+        """Bind the names each import brings into scope.
+
+        Nothing is executed and no file is read: an import here resolves
+        against the table in semantic/modules.py, and fails with the reason
+        when a module cannot be expressed in this subset at all.
+        """
+        for node in getattr(program, "imports", ()):
+            try:
+                module = modules.resolve(node.module, node.line)
+            except modules.ModuleError as e:
+                raise SemanticError(str(e)) from e
+
+            if module.profile is not None and module.profile not in self.profiles:
+                self.profiles.append(module.profile)
+
+            # `import math` / `import math as m`
+            if node.members is None and not node.star:
+                alias = node.alias or node.module
+                self.module_aliases[alias] = module
+                continue
+
+            # `from math import *`
+            #
+            # A member whose name a builtin already owns is skipped rather
+            # than rejected: `math.pow` and the builtin `pow` mean nearly the
+            # same thing, and refusing the whole star import over that would
+            # be unhelpful. The builtin keeps the name, and `math.pow` is
+            # still reachable through the module. Asking for the collision
+            # *by name* — `from math import pow` — is still an error, because
+            # that request cannot be honoured as written.
+            if node.star:
+                for name in module.names():
+                    if name in RESERVED_NAMES:
+                        continue
+                    self._bind_imported(name, module, module.get(name), node.line)
+                continue
+
+            # `from math import sqrt, cos as c`
+            for member_name, local in node.members:
+                member = module.get(member_name)
+                if member is None:
+                    raise SemanticError(
+                        f"line {node.line}: '{module.name}' has no member "
+                        f"'{member_name}' in this subset.\n"
+                        f"  It offers: {', '.join(module.names())}."
+                    )
+                self._bind_imported(local, module, member, node.line)
+
+    def _bind_imported(self, local, module, member, line):
+        if local in RESERVED_NAMES:
+            raise SemanticError(
+                f"line {line}: '{local}' is a builtin in this subset, so an import "
+                f"cannot bind that name. Import it under another name "
+                f"(`as {local}_`) or call it through the module."
+            )
+        self.imported[local] = (module, member)
+
+    def _module_member(self, name):
+        """Resolve a call or name to (Module, Member), or None.
+
+        `name` is either a plain name a from-import bound, or the canonical
+        `module.member` the parser builds for dotted access.
+        """
+        if name in self.imported:
+            return self.imported[name]
+        if "." in name:
+            alias, _, member_name = name.partition(".")
+            module = self.module_aliases.get(alias)
+            if module is not None:
+                member = module.get(member_name)
+                if member is None:
+                    return (module, None)
+                return (module, member)
+        return None
 
     def _check_entry_point(self, program):
         main = self.symtab.functions.get("main")
@@ -346,7 +432,11 @@ class TypeChecker:
         elif isinstance(expr, A.NoneLit):
             t = "None"
         elif isinstance(expr, A.Name):
-            t = self._lookup(expr.id, expr.line)
+            resolved = self._module_member(expr.id)
+            if resolved is not None and expr.id not in self.env:
+                t = self._module_constant(expr, resolved)
+            else:
+                t = self._lookup(expr.id, expr.line)
         elif isinstance(expr, A.BinOp):
             lt = self._infer(expr.left)
             rt = self._infer(expr.right)
@@ -433,6 +523,10 @@ class TypeChecker:
             call.kind = "user"
             return entry["return_type"]
 
+        resolved = self._module_member(call.name)
+        if resolved is not None:
+            return self._check_module_call(call, resolved, arg_types)
+
         if call.name in BUILTINS:
             call.kind = "builtin"
             try:
@@ -460,6 +554,59 @@ class TypeChecker:
         # Unknown callees are assumed to produce a double. That is the widest
         # numeric type, so it can never silently truncate a real result.
         return "float"
+
+    # ------------------------------------------------------------- modules
+
+    def _check_module_call(self, call: A.Call, resolved, arg_types):
+        module, member = resolved
+        where = call.name if "." in call.name else f"{module.name}.{call.name}"
+
+        if member is None:
+            _, _, member_name = call.name.partition(".")
+            raise SemanticError(
+                f"line {call.line}: '{module.name}' has no member '{member_name}' "
+                f"in this subset.\n  It offers: {', '.join(module.names())}."
+            )
+        if not member.is_function:
+            raise SemanticError(
+                f"line {call.line}: '{where}' is a number, not a function — "
+                f"use it without the parentheses"
+            )
+        if len(arg_types) not in member.arities:
+            raise SemanticError(
+                f"line {call.line}: '{where}' takes {_arity_words(member.arities)} "
+                f"argument(s), got {len(arg_types)}"
+            )
+        for i, t in enumerate(arg_types, 1):
+            if not is_numeric(t):
+                raise SemanticError(
+                    f"line {call.line}: argument {i} of '{where}' is {t}; every "
+                    f"argument of an imported function must be a number"
+                )
+        call.kind = "module"
+        call.member = member
+        return member.return_type
+
+    def _module_constant(self, node: A.Name, resolved):
+        module, member = resolved
+        where = node.id if "." in node.id else f"{module.name}.{node.id}"
+        if member is None:
+            _, _, member_name = node.id.partition(".")
+            raise SemanticError(
+                f"line {node.line}: '{module.name}' has no member '{member_name}' "
+                f"in this subset.\n  It offers: {', '.join(module.names())}."
+            )
+        if member.is_function:
+            raise SemanticError(
+                f"line {node.line}: '{where}' is a function here; it needs "
+                f"parentheses to be called"
+            )
+        node.member = member
+        return member.return_type
+
+
+def _arity_words(arities):
+    return " or ".join(str(n) for n in sorted(arities))
 
 
 # --------------------------------------------------------------- utilities
