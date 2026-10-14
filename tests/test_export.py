@@ -147,3 +147,39 @@ def test_exports_never_overwrite_an_earlier_one(tmp_path):
     second = export_python(SOURCE, str(tmp_path), "bundle")
     assert first["folder"] != second["folder"]
     assert os.path.exists(first["folder"]) and os.path.exists(second["folder"])
+
+
+def test_exported_python_gets_a_put_shim(tmp_path):
+    """put() is a compiler builtin with no CPython equivalent. Without a shim
+    the exported file raises NameError at the first character it draws."""
+    source = ("def main() -> int:\n"
+              '    put("ab")\n'
+              '    put("\\n")\n'
+              "    return 0\n")
+    report = export_python(source, str(tmp_path))
+    result = subprocess.run([sys.executable,
+                             os.path.join(report["folder"], "program.py")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ab\n"
+
+
+def test_put_shim_is_added_only_when_put_is_used():
+    from src.export import runnable_python, uses_builtin
+
+    plain = "def main() -> int:\n    print(1)\n    return 0\n"
+    assert not uses_builtin(plain, "put")
+    assert "def put" not in runnable_python(plain)
+
+    draws = 'def main() -> int:\n    put("x")\n    return 0\n'
+    assert uses_builtin(draws, "put")
+    assert "def put" in runnable_python(draws)
+
+
+def test_mentioning_put_in_a_comment_does_not_add_the_shim():
+    """Detection walks the parsed program, not the text."""
+    from src.export import uses_builtin
+
+    source = ("# this program does not call put\n"
+              'def main() -> int:\n    print("put")\n    return 0\n')
+    assert not uses_builtin(source, "put")

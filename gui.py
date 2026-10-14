@@ -1,20 +1,3 @@
-"""
-Translation Compiler — an IDE for the hybrid Python-subset -> C compiler.
-
-    py gui.py        (from the translation-compiler/ directory)
-
-Layout, roughly ChatGPT's: a quiet sidebar of past translations on the left, a
-single accent colour, generous spacing, and a light/dark toggle that follows
-the same palette.
-
-  * left  — history of translations, click to restore
-  * top   — file actions, model picker, AI-assist switch, Translate
-  * main  — Python source (editable) beside generated C (read-only)
-  * bottom— Pipeline / Terminal / AI tabs
-
-No third-party dependencies: standard-library tkinter only.
-"""
-
 import json
 import os
 import subprocess

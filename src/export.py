@@ -118,14 +118,56 @@ def needs_math_import(source):
         return False
 
 
+def uses_builtin(source, name):
+    """True if `source` calls the named builtin. Determined by walking the
+    parsed program rather than searching the text, so a mention in a comment
+    or a string does not count."""
+    try:
+        from .lexer.lexer import Lexer
+        from .parser import ast_nodes as A
+        from .parser.parser import Parser
+
+        program = Parser(Lexer(source).tokenize()).parse_program()
+
+        def walk(node):
+            import dataclasses
+            if dataclasses.is_dataclass(node) and not isinstance(node, type):
+                if isinstance(node, A.Call) and node.name == name:
+                    return True
+                return any(walk(getattr(node, f.name))
+                           for f in dataclasses.fields(node))
+            if isinstance(node, (list, tuple)):
+                return any(walk(item) for item in node)
+            return False
+
+        return walk(program)
+    except Exception:
+        return False
+
+
 def runnable_python(source):
-    """The source plus whatever it needs to run directly under CPython."""
+    """The source plus whatever it needs to run directly under CPython.
+
+    Three things are missing from a subset program on its own, and without all
+    three `python program.py` either crashes or silently does nothing:
+
+      * the maths functions, which the subset has no import syntax for;
+      * `put`, which is a compiler builtin with no CPython equivalent;
+      * a call to main(), because the compiler synthesises C's entry point and
+        the source itself only ever defines functions.
+    """
     parts = []
     if needs_math_import(source):
         parts.append("# These live in Python's math module. The compiler has no\n"
                      "# import syntax, so the translator asks the model for a C\n"
                      "# equivalent; CPython just needs the import.\n"
                      "from math import *\n\n")
+    if uses_builtin(source, "put"):
+        parts.append("# put() is a compiler builtin: it writes a string with no\n"
+                     "# newline and no separator, which print() cannot do.\n"
+                     "import sys\n\n\n"
+                     "def put(s):\n"
+                     "    sys.stdout.write(s)\n\n\n")
     parts.append(source.rstrip("\n") + "\n")
     if "def main(" in source and "\nmain()" not in source:
         parts.append('\n\nif __name__ == "__main__":\n    main()\n')
