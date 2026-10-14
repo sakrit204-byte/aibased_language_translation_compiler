@@ -84,6 +84,7 @@ THEMES = {
         "warn":      "#e2b53d",
         "sel":       "#2f4f47",
         "errline":   "#4a2326",
+        "addline":   "#1d3a2a",
         # syntax
         "kw":        "#c792ea",
         "type":      "#e5c07b",
@@ -112,6 +113,7 @@ THEMES = {
         "warn":      "#946200",
         "sel":       "#d3ece4",
         "errline":   "#fde8e8",
+        "addline":   "#e6f6ec",
         "kw":        "#8250df",
         "type":      "#953800",
         "str":       "#0a7f3f",
@@ -700,12 +702,24 @@ class TranslationCompilerApp:
         self.current_file = None
         self.pipeline = None
         self.active_stage = "lexer"
+        # Before/after of the last Simplify run, so the AI panel can
+        # show the exact lines that changed rather than a summary.
+        self.simplify_before = None
+        self.simplify_after = None
+        self.simplify_candidate = None
+        self.simplify_report = None
         self.history = []
         self.busy = False
         self.c_compiler = find_c_compiler()
 
-        self.model_var = tk.StringVar(value=self.settings.get("model",
-                                                             ai_client.DEFAULT_MODEL))
+        # A model name saved by an older build may no longer be valid — the
+        # project moved from Ollama to OpenRouter, and sending "qwen2.5-coder:7b"
+        # to OpenRouter is an HTTP 400 that surfaces much later as a confusing
+        # "simplification rejected". Fall back to the default instead.
+        saved_model = self.settings.get("model", ai_client.DEFAULT_MODEL)
+        if saved_model not in ai_client.AVAILABLE_MODELS and "(ollama)" not in saved_model:
+            saved_model = ai_client.DEFAULT_MODEL
+        self.model_var = tk.StringVar(value=saved_model)
         self.ai_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.position_var = tk.StringVar(value="Ln 1, Col 1")
@@ -775,6 +789,12 @@ class TranslationCompilerApp:
         widget.tag_configure("warn", foreground=t["warn"])
         widget.tag_configure("dim", foreground=t["dim"])
         widget.tag_configure("cmd", foreground=t["accent"])
+        # Diff colours: a removed line is shown against a tinted background so
+        # it reads as a deletion even in a screenshot printed in black and white.
+        widget.tag_configure("del", foreground=t["err"], background=t["errline"])
+        widget.tag_configure("add", foreground=t["ok"], background=t["addline"])
+        widget.tag_configure("hunk", foreground=t["accent"], background=t["raised"])
+        widget.tag_configure("mono", font=self.font_small_mono)
 
     # ------------------------------------------------------------------
     #  LAYOUT
@@ -898,12 +918,15 @@ class TranslationCompilerApp:
 
         self.source_pane = EditorPane(
             panes, self, "Source", "Python", readonly=False,
-            actions=(("Format", self.normalise_source),))
+            actions=(("⬓ Extract as file", self.extract_python),
+                     ("Format", self.normalise_source)))
         panes.add(self.source_pane, minsize=320, stretch="always")
 
         self.output_pane = EditorPane(
             panes, self, "Generated C", "C", readonly=True,
-            actions=(("Copy", self.copy_output), ("Save .c", self.save_output)))
+            actions=(("⬓ Extract as file", self.extract_c),
+                     ("✦ Simplify", self.simplify_output),
+                     ("Copy", self.copy_output)))
         panes.add(self.output_pane, minsize=320, stretch="always")
         # Kept on the instance so the split can be repositioned (and so the
         # two editors can be balanced on first show rather than defaulting to
@@ -1109,6 +1132,175 @@ class TranslationCompilerApp:
             f.write(code)
         self.set_status(f"Saved {os.path.basename(path)}", "ok")
 
+    def simplify_output(self):
+        """Ask the model to simplify the generated C, and keep its answer only
+        if both versions produce identical output."""
+        if self.busy:
+            return
+        code = self.output_pane.get_text()
+        if not code.strip() or code.lstrip().startswith("/* No C was generated"):
+            self.set_status("Translate something first — there is no C to simplify",
+                            "warn")
+            return
+        if not self.c_compiler:
+            self.show_tab("terminal")
+            self._write_terminal(
+                "Simplify needs a C compiler: both versions are built and run so "
+                "their output can be compared.\n" + install_hint() + "\n", "err")
+            return
+
+        self.busy = True
+        self.translate_button.set_enabled(False)
+        self.simplify_before = code
+        self.simplify_after = None
+        self.simplify_candidate = None
+        self.simplify_report = None
+        self.set_status("Simplifying, then verifying both versions produce the "
+                        "same output…")
+        self.show_tab("terminal")
+        self._write_terminal(f"\n$ simplify  ({self.model_var.get()})\n", "cmd")
+        threading.Thread(target=self._simplify_worker,
+                         args=(code, self.model_var.get()), daemon=True).start()
+
+    def _simplify_worker(self, code, model):
+        from src.ai_assist.simplify import simplify
+
+        log_path = os.path.join(REPORTS_DIR, "ai_invocation_log.md")
+        try:
+            result, report = simplify(code, model=model, log_path=log_path)
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            self.root.after(0, lambda: self._on_simplify_failed(message))
+            return
+        self.root.after(0, lambda: self._on_simplify_done(result, report))
+
+    def _on_simplify_failed(self, message):
+        self._finish()
+        self._write_terminal(f"simplify failed: {message}\n", "err")
+        self.set_status("Simplify failed — the generated C is unchanged", "err")
+
+    def _on_simplify_done(self, result, report):
+        self._finish()
+        self.simplify_report = report
+        self.simplify_after = result
+        # Keep the rejected candidate too: seeing *what* the model got wrong is
+        # more informative than being told that something was wrong.
+        for attempt in reversed(report["attempts"]):
+            if attempt.get("candidate"):
+                self.simplify_candidate = attempt["candidate"]
+                break
+
+        for attempt in report["attempts"]:
+            tone = "ok" if attempt.get("ok") else "err"
+            self._write_terminal(
+                f"  attempt {attempt['attempt']}: {attempt.get('stage')} — "
+                f"{'accepted' if attempt.get('ok') else attempt.get('reason', '')}\n",
+                tone)
+
+        if not report["accepted"]:
+            self._write_terminal(f"{report['reason']}\n", "warn")
+            self._write_terminal(
+                "The original C is unchanged. Nothing is accepted unless it "
+                "compiles and produces byte-identical output.\n", "dim")
+            self.set_status("Simplification rejected — original kept", "warn")
+            return
+
+        before, after = report["original_lines"], report["simplified_lines"]
+        saved = 100 * (1 - after / before) if before else 0
+        self.output_pane.set_text(result)
+        self._write_terminal(
+            f"verified: {report['baseline']['lines']} line(s) of output and exit "
+            f"code {report['baseline']['exit']} are identical\n", "ok")
+        self._write_terminal(f"{before} -> {after} lines ({saved:.0f}% smaller)\n", "ok")
+        self._write_terminal("Open the 'AI gate' tab to see the exact lines that "
+                             "changed.\n", "dim")
+        self.set_status(f"✦ Simplified {before} → {after} lines, output verified "
+                        f"identical", "ok")
+
+    # ------------------------------------------------------------------
+    #  EXTRACT AS FILE
+    # ------------------------------------------------------------------
+
+    def _base_name(self):
+        if self.current_file:
+            return os.path.splitext(os.path.basename(self.current_file))[0]
+        return "program"
+
+    def extract_python(self):
+        """Write the Python source out as a folder anyone can run."""
+        source = self.source_pane.get_text()
+        if not source.strip():
+            self.set_status("Nothing to extract — the source pane is empty", "warn")
+            return
+        self._extract("python", source)
+
+    def extract_c(self):
+        """Write the generated C out as a folder, with the binary pre-built."""
+        code = self.output_pane.get_text()
+        if not code.strip() or code.lstrip().startswith("/* No C was generated"):
+            self.set_status("Translate first — there is no C to extract", "warn")
+            return
+        self._extract("c", code)
+
+    def _extract(self, kind, code):
+        from src.export import export_c, export_python
+
+        destination = filedialog.askdirectory(
+            title=f"Choose where to create the {'Python' if kind == 'python' else 'C'} "
+                  f"folder",
+            mustexist=True)
+        if not destination:
+            return
+
+        name = self._base_name()
+        self.show_tab("terminal")
+        try:
+            if kind == "python":
+                report = export_python(code, destination, f"{name}_python")
+            else:
+                report = export_c(code, destination, f"{name}_c")
+        except OSError as error:
+            self._write_terminal(f"extract failed: {error}\n", "err")
+            self.set_status("Extract failed", "err")
+            return
+
+        folder = report["folder"]
+        self._write_terminal(f"\n$ extract {report['kind']}  ->  {folder}\n", "cmd")
+        for filename in report["files"]:
+            self._write_terminal(f"    {filename}\n", "ok")
+
+        if kind == "c":
+            if report["binary"]:
+                self._write_terminal(
+                    f"  The binary is pre-built: double-click run.bat and it runs "
+                    f"immediately,\n  with no compiler needed on that machine.\n", "dim")
+            else:
+                self._write_terminal(
+                    "  No binary was pre-built"
+                    + (f" ({report['build_error'].strip()[:160]})"
+                       if report.get("build_error") else "")
+                    + ";\n  run.bat will compile program.c the first time it runs.\n",
+                    "warn")
+        else:
+            self._write_terminal(
+                "  Double-click run.bat (or ./run.sh) to run it. Needs only Python.\n",
+                "dim")
+
+        self.set_status(f"Extracted to {os.path.basename(folder)}", "ok")
+        self._offer_to_open(folder)
+
+    def _offer_to_open(self, folder):
+        if messagebox.askyesno("Extracted",
+                               f"Created:\n{folder}\n\nOpen the folder now?"):
+            try:
+                if os.name == "nt":
+                    os.startfile(folder)                      # noqa: S606
+                else:
+                    subprocess.run(["open" if sys.platform == "darwin" else "xdg-open",
+                                    folder], check=False)
+            except OSError as error:
+                self._write_terminal(f"  could not open the folder: {error}\n", "warn")
+
     def copy_output(self):
         code = self.output_pane.get_text()
         if not code.strip():
@@ -1141,6 +1333,10 @@ class TranslationCompilerApp:
         self.translate_button.set_enabled(False)
         self.source_pane.clear_error()
         self.pipeline = None
+        self.simplify_before = None
+        self.simplify_after = None
+        self.simplify_candidate = None
+        self.simplify_report = None
         self._refresh_stage_chips()
         self.set_status("Translating…")
         threading.Thread(target=self._translate_worker, args=(source,),
@@ -1327,6 +1523,88 @@ class TranslationCompilerApp:
                     self._append_detail(f"      {attempt['reason']}\n", "dim")
             self._append_detail(f"    accepted: {record['accepted']!r}\n\n", "ok")
 
+    def _write_diff(self, before, after, context=2):
+        """Render a line-by-line unified diff into the console.
+
+        Shown so the model's edit can be read rather than taken on trust: every
+        line it removed and every line it put in their place, with the counts.
+        """
+        import difflib
+
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
+        diff = list(difflib.unified_diff(
+            before_lines, after_lines,
+            fromfile="generated.c", tofile="simplified.c",
+            lineterm="", n=context))
+
+        if not diff:
+            self._write_terminal("  the two files are identical\n", "dim")
+            return
+
+        removed = sum(1 for d in diff if d.startswith("-") and not d.startswith("---"))
+        added = sum(1 for d in diff if d.startswith("+") and not d.startswith("+++"))
+        self._write_terminal(
+            f"  {removed} line(s) removed, {added} line(s) added   "
+            f"({len(before_lines)} -> {len(after_lines)} lines)\n\n", "dim")
+
+        for line in diff:
+            if line.startswith(("---", "+++")):
+                continue
+            if line.startswith("@@"):
+                self._write_terminal(f"  {line}\n", "hunk")
+            elif line.startswith("-"):
+                self._write_terminal(f"  {line}\n", "del")
+            elif line.startswith("+"):
+                self._write_terminal(f"  {line}\n", "add")
+            else:
+                self._write_terminal(f"  {line}\n", "dim")
+
+    def _write_gate_substitutions(self):
+        """Show what each AI-resolved call became: Python call on the left, the
+        C expression that replaced it on the right."""
+        records = ((self.pipeline or {}).get("stages", {})
+                   .get("ai_gate", {}).get("records", []))
+        if not records:
+            return
+
+        # One row per distinct function, not per call site: a program that
+        # calls sqrt three times asked the same question once.
+        rows = {}
+        for record in records:
+            key = record["call"]
+            entry = rows.setdefault(key, {"uses": 0, "accepted": record.get("accepted"),
+                                          "source": record.get("source", "model")})
+            entry["uses"] += 1
+            if record.get("source") == "model":
+                entry["source"] = "model"      # prefer the run that did the work
+
+        self._write_terminal("\nWhat the model translated\n", "head")
+        self._write_terminal(
+            "  Python call on the left, the C expression it became on the right.\n"
+            "  a0 and a1 stand for the call's own arguments.\n\n", "dim")
+
+        for key in sorted(rows):
+            entry = rows[key]
+            name, _, arity = key.partition("/")
+            call = f"{name}({', '.join(f'a{i}' for i in range(int(arity or 0)))})"
+            if not entry["accepted"]:
+                self._write_terminal(f"  {call:<18} ->  rejected\n", "del")
+                continue
+
+            self._write_terminal(f"  {call:<18}", "del")
+            self._write_terminal(" ->  ", "dim")
+            self._write_terminal(f"{entry['accepted']}", "add")
+
+            note = f"   [{entry['source']}]"
+            if entry["uses"] > 1:
+                note += f" x{entry['uses']} call sites"
+            # A derived translation is the interesting case: there is no C
+            # `degrees()` to rename, so the model had to work the maths out.
+            if entry["accepted"].replace(" ", "") != call.replace(" ", ""):
+                note += "  derived — no direct C equivalent"
+            self._write_terminal(note + "\n", "dim")
+
     def render_ai_report(self):
         self._clear_console()
         stage = (self.pipeline or {}).get("stages", {}).get("ai_gate")
@@ -1348,12 +1626,49 @@ class TranslationCompilerApp:
             return
         self._write_terminal(f"Last run: {stage.get('status')}\n",
                              "ok" if stage.get("status") in ("disabled", "skipped") else "warn")
+
+        self._write_gate_substitutions()
+
         for record in stage.get("records", []):
-            self._write_terminal(f"\n{record['call']} via {record['source']}\n", "head")
-            for attempt in record.get("attempts", []):
-                self._write_terminal(f"  {attempt}\n",
-                                     "ok" if attempt.get("valid") else "err")
-            self._write_terminal(f"  accepted: {record['accepted']!r}\n", "ok")
+            attempts = record.get("attempts", [])
+            if not attempts:
+                continue                      # a cache hit has nothing to narrate
+            self._write_terminal(f"\n{record['call']} — how it was obtained\n", "head")
+            for attempt in attempts:
+                tone = "ok" if attempt.get("valid") else "err"
+                candidate = attempt.get("candidate", attempt.get("error", ""))
+                self._write_terminal(
+                    f"  attempt {attempt.get('attempt', '?')}: {candidate!r}\n", tone)
+                if attempt.get("reason"):
+                    self._write_terminal(f"    {attempt['reason']}\n", "dim")
+
+        self._write_simplify_diff()
+
+    def _write_simplify_diff(self):
+        """Append the before/after of the last Simplify run, if there was one."""
+        if not self.simplify_before:
+            return
+        report = self.simplify_report or {}
+        self._write_terminal("\n" + "─" * 60 + "\n", "dim")
+        self._write_terminal("Simplify — line-by-line changes\n", "head")
+
+        if not report.get("accepted"):
+            self._write_terminal(
+                f"  REJECTED: {report.get('reason', 'no candidate')}\n", "err")
+            self._write_terminal(
+                "  The generated C below is unchanged. Nothing is accepted unless "
+                "it\n  compiles and produces byte-identical output.\n", "dim")
+            if self.simplify_candidate:
+                self._write_terminal(
+                    "\n  What the model proposed, and why it was refused:\n\n", "dim")
+                self._write_diff(self.simplify_before, self.simplify_candidate)
+            return
+
+        baseline = report.get("baseline") or {}
+        self._write_terminal(
+            f"  ACCEPTED — verified identical: {baseline.get('lines', '?')} line(s) "
+            f"of output and exit code {baseline.get('exit', '?')} match\n\n", "ok")
+        self._write_diff(self.simplify_before, self.simplify_after)
 
     # ------------------------------------------------------------------
     #  RUNNING

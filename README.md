@@ -95,19 +95,73 @@ Every attempt, accepted or rejected, is appended to
 `tests/test_ai_policy.py` asserts all of this with the model stubbed out, so the
 policy is tested even on a machine with no model installed.
 
+### Providers
+
+The model is reached through OpenRouter, so one API key covers every option.
+Put it in `OPENROUTER_API_KEY` or in `secrets/openrouter_key.txt`, which
+`.gitignore` excludes.
+
+| Model | Cost per translation | Notes |
+| --- | --- | --- |
+| `anthropic/claude-haiku-5.5` | ~$0.00005 | **default** — reliable, answers in ~2s |
+| `anthropic/claude-sonnet-5.5` | ~$0.0005 | stronger, for the Simplify pass |
+| `google/gemma-4-31b-it:free` | free | shared upstream pool, HTTP 429 about half the time |
+| `google/gemma-4-31b-it` | ~$0.00003 | the same model, paid endpoint |
+| `… (ollama)` | free | fully offline, needs `ollama serve` |
+
+The free Gemma endpoint is retried three times and then falls back to the paid
+endpoint for the same model, because without that a demo fails about one run in
+two. Pick any of them with `--model` or from the GUI dropdown.
+
 ### Trying the AI path
 
 ```bash
-ollama pull qwen2.5-coder:7b
-ollama serve &
-python -m src.driver tests/programs/ai_math_demo.py -o out.c --ai
+# Ten programs that cannot be translated without the gate
+python -m src.driver tests/programs/ai/01_pythagoras.py --run --ai
+
+# The same ten, compiled and diffed against CPython
 RUN_AI_TESTS=1 python -m pytest tests/ -q
 ```
 
-`ai_math_demo.py` calls `hypot`, `degrees` and `log` — real functions that live
-in Python's `math` module, which this subset has no import syntax for. Without
-`--ai` you get a hard error naming the missing function; with it, each is sent
-to the gate once.
+`tests/programs/ai/` holds ten programs that each call at least one function
+with no static rule — `sqrt`, `sin`, `atan2`, `erf`, `radians` and so on. Every
+one is a hard compile error without `--ai`. All ten produce output
+byte-identical to CPython with it.
+
+The clearest single case is `degrees`. There is no C `degrees()` to rename, so
+the model has to *derive* `a0 * (180.0 / M_PI)` — and the compiler then proves
+that derivation compiles before using it.
+
+## Simplify: AI rewriting, accepted only when proven equivalent
+
+`--simplify` on the CLI, or the **✦ Simplify** button in the IDE, asks the model
+to tidy the generated C. Its answer is accepted only if it survives three
+checks, in this order:
+
+1. A **safety check** over code with comments and string literals stripped —
+   no process, file, network or environment access, and no header the original
+   did not already use. This runs *first*, because verification executes the
+   result.
+2. It must **compile**.
+3. Both binaries are run and their **stdout and exit status compared byte for
+   byte**.
+
+Programs in this subset take no input — no `input()`, no files, no clock, no
+randomness, and the grammar cannot express any of them. Standard output and
+exit status are therefore the *entire* observable behaviour, so step 3 is not a
+sample of it; it is all of it. For the program as written, equivalence is
+established rather than estimated.
+
+Both outcomes happen in practice:
+
+```
+10_projectile.py   ACCEPTED  213 -> 99 lines (54% smaller), 7 output lines verified
+arithmetic.py      REJECTED  line 20 became '-7.5  = 0.5', expected '-7.5 % 2 = 0.5'
+```
+
+The rejection is the interesting one: the model dropped a `%` from a `printf`
+format string. The result compiled cleanly and looked fine. Only running it
+caught the corruption.
 
 ## Architecture
 
@@ -145,7 +199,7 @@ Three analyses run per function in the semantic phase:
 | `src/parser/` | recursive-descent parser and AST nodes |
 | `src/semantic/` | symbol table, type checker, builtin type rules |
 | `src/codegen/` | AST → C rules, the emitter, and the C runtime prelude |
-| `src/ai_assist/` | gate (policy), Ollama client, safety + compiler validator |
+| `src/ai_assist/` | gate (policy), multi-provider client, safety + compiler validator, verified simplifier |
 | `src/toolchain.py` | finds whichever C compiler is installed |
 | `src/driver.py` | CLI and pipeline orchestration |
 | `gui.py` | the IDE |
