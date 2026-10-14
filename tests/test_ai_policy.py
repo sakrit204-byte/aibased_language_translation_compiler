@@ -43,7 +43,7 @@ def fake_model(monkeypatch):
     def install(*replies):
         state = {"calls": [], "replies": list(replies)}
 
-        def fake_query(prompt, model=None, timeout=60):
+        def fake_query(prompt, model=None, timeout=60, trace=None, max_tokens=256):
             state["calls"].append(prompt)
             if not state["replies"]:
                 raise client.AIClientError("no more scripted replies")
@@ -169,7 +169,7 @@ def test_gate_raises_rather_than_emitting_an_unvalidated_stub(fake_model, tmp_pa
 
 
 def test_gate_fails_when_the_model_is_unreachable(monkeypatch, tmp_path):
-    def unreachable(prompt, model=None, timeout=60):
+    def unreachable(prompt, model=None, timeout=60, trace=None, max_tokens=256):
         raise client.AIClientError("connection refused")
 
     monkeypatch.setattr(gate_module.client, "query", unreachable)
@@ -217,11 +217,33 @@ def test_every_attempt_is_logged(fake_model, tmp_path):
 
 
 def test_sampling_is_pinned_to_zero_temperature():
-    """A compiler that emits different output on two identical runs is not one."""
+    """A compiler that emits different output on two identical runs is not one.
+
+    Checked on every transport, not just one: the OpenRouter path and the
+    Ollama path each build their own request body.
+    """
     import inspect
-    source = inspect.getsource(client.query)
-    assert '"temperature": 0' in source
-    assert '"seed"' in source
+
+    for transport in (client._openrouter_call, client._ollama_call):
+        source = inspect.getsource(transport)
+        assert '"temperature": 0' in source, transport.__name__
+        assert "seed" in source.lower(), transport.__name__
+
+
+def test_api_key_is_never_hard_coded():
+    """The key must come from the environment or the gitignored secrets file."""
+    import inspect
+
+    source = inspect.getsource(client)
+    assert "sk-or-v1-" not in source, "an API key literal is present in client.py"
+    assert "OPENROUTER_API_KEY" in source
+
+
+def test_key_status_does_not_leak_the_whole_key():
+    status = client.key_status()
+    key = client.api_key()
+    if key:
+        assert key not in status, "key_status() exposed the full key"
 
 
 def test_placeholder_substitution_wraps_arguments():

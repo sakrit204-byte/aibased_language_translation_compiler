@@ -17,3 +17,9 @@ venv/
 env/
 .pytest_cache/
 *.tmp
+
+# Secrets — never commit
+.env
+*.key
+secrets/
+openrouter_key.txt

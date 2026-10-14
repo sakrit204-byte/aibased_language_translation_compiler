@@ -39,6 +39,12 @@ from .validator import validate
 MAX_ATTEMPTS = 3
 CACHE_VERSION = 1
 
+# A C expression is a few dozen tokens, but a reasoning model spends tokens
+# thinking before it writes any content: Claude Haiku 5.5 used 78 reasoning
+# tokens on `degrees(a0)` and returned an empty string when the budget was 120.
+# The ceiling still stops a non-reasoning model narrating an essay.
+EXPRESSION_TOKEN_BUDGET = 600
+
 
 class AIAssistError(Exception):
     """Raised when no valid translation could be obtained."""
@@ -141,7 +147,14 @@ def _extract_expression(raw: str) -> str:
             text = line
             break
 
-    return text.strip().rstrip(";").strip()
+    text = text.strip().rstrip(";").strip()
+
+    # Some models wrap a one-line answer in single backticks (`a0 * 180.0 / M_PI`).
+    # The safety check forbids backticks, so an otherwise perfect answer would be
+    # rejected for its punctuation.
+    while len(text) > 1 and text.startswith("`") and text.endswith("`"):
+        text = text[1:-1].strip()
+    return text
 
 
 # ---------------------------------------------------------------- the gate
@@ -174,11 +187,16 @@ class Gate:
         previous = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             started = time.time()
+            # A single C expression needs very few tokens. Left unbounded the
+            # model narrates its reasoning first, which turns a one-second call
+            # into a forty-second one.
+            trace = []
             try:
-                raw = client.query(_prompt(name, arity, previous), model=self.model)
+                raw = client.query(_prompt(name, arity, previous), model=self.model,
+                                   max_tokens=EXPRESSION_TOKEN_BUDGET, trace=trace)
                 self.queries_made += 1
             except client.AIClientError as e:
-                attempts.append({"attempt": attempt, "error": str(e)})
+                attempts.append({"attempt": attempt, "error": str(e), "providers": trace})
                 break
 
             candidate = _extract_expression(raw)
@@ -189,6 +207,7 @@ class Gate:
                 "valid": ok,
                 "reason": reason,
                 "seconds": round(time.time() - started, 2),
+                "providers": trace,
             })
             if ok:
                 self.cache.put(name, arity, candidate, self.model)
