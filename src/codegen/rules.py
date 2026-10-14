@@ -256,6 +256,11 @@ class CodegenRules:
         if name == "len":
             return f"(py_int)strlen({args[0]})"
 
+        if name == "put":
+            # No separator, no newline, no allocation — the counterpart to
+            # print() that lets a program build a line one piece at a time.
+            return f"fputs({args[0]}, stdout)"
+
         if name == "abs":
             if types[0] == "float":
                 return f"fabs({args[0]})"

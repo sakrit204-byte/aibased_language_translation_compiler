@@ -79,6 +79,26 @@ def _len(arg_types, args, line):
     return "int"
 
 
+def _put(arg_types, args, line):
+    """Write a string with no newline and no separator.
+
+    `print` always ends a line and always puts a space between its arguments,
+    so with it alone a program can emit lines but never build one. Since the
+    subset also has no string concatenation — that needs an allocator the
+    generated C deliberately does without — there was no way to draw a row of
+    characters at all. `put` closes that gap for one `fputs` and no memory.
+    """
+    if len(arg_types) != 1:
+        raise BuiltinError(f"line {line}: put() takes exactly one argument, "
+                           f"got {len(arg_types)}")
+    if arg_types[0] != "str":
+        raise BuiltinError(
+            f"line {line}: put() writes a str, got {arg_types[0]}. Use print() "
+            f"for numbers, or convert explicitly."
+        )
+    return "None"
+
+
 def _abs(arg_types, args, line):
     if len(arg_types) != 1:
         raise BuiltinError(f"line {line}: abs() takes exactly one argument, got {len(arg_types)}")
@@ -154,6 +174,7 @@ def _bool(arg_types, args, line):
 
 BUILTINS = {
     "len": _len,
+    "put": _put,
     "abs": _abs,
     "min": _min_max("min"),
     "max": _min_max("max"),

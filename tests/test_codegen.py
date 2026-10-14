@@ -137,6 +137,11 @@ def test_every_builtin_with_a_type_rule_has_a_c_template():
 
 
 def _sample_call(name):
+    # put() returns None, so it is exercised as a statement rather than in a
+    # return. Every other builtin produces a value.
+    if name == "put":
+        return 'def f() -> None:\n    put("x")\n'
+
     calls = {
         "len": 'len("abc")',
         "abs": "abs(-1)",
@@ -167,3 +172,26 @@ def test_prelude_emits_dependencies_before_dependents():
     text = prelude_for({"py_print_float"})
     assert text.index("py_repr_float(char") < text.index("void py_print_float")
     assert text.index("py__print_sep(void)") < text.index("void py_print_float")
+
+
+def test_put_writes_without_a_newline_or_separator():
+    """print() always ends a line and always separates its arguments, so
+    without put() a program can emit lines but never build one — and the
+    subset has no string concatenation to build one with."""
+    c = emit('put("a")\nput("b")\nput(" ")\n')
+    assert c.count('fputs("a", stdout)') == 1
+    assert c.count('fputs("b", stdout)') == 1
+    # The word "printf" also appears in a prelude comment, so match the call.
+    assert "printf(" not in c, "put() must not go through printf"
+
+
+def test_put_can_emit_a_newline():
+    c = emit('put("x")\nput("\\n")\n')
+    assert 'fputs("\\n", stdout)' in c
+
+
+def test_put_rejects_a_non_string():
+    from src.semantic.symbol_table import SemanticError
+
+    with pytest.raises(SemanticError, match=r"put\(\) writes a str"):
+        compile_source("def f() -> None:\n    put(42)\n")

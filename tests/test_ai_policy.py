@@ -67,6 +67,12 @@ def test_no_sample_program_uses_ai_even_when_it_is_enabled(filename):
 def test_builtins_are_never_routed_to_ai(name, fake_model):
     """If a builtin ever reached the model, this scripted client would be called."""
     state = fake_model()
+    if name == "put":
+        # put() returns None, so it is a statement rather than a return value.
+        compile_source('def f() -> None:\n    put("x")\n', use_ai=True)
+        assert state["calls"] == [], "put was sent to the model"
+        return
+
     samples = {
         "len": ('len("ab")', "int"), "abs": ("abs(-1)", "int"),
         "min": ("min(1, 2)", "int"), "max": ("max(1, 2)", "int"),

@@ -61,7 +61,7 @@ know, never a substitute for a rule it should have.**
 A call reaches `src/ai_assist/gate.py` only if the semantic phase tagged it
 `kind == "ai"`, which happens only when the callee is neither defined in the
 program nor one of the builtins with a static C rule (`len`, `abs`, `min`,
-`max`, `pow`, `round`, `int`, `float`, `bool`). By construction the model is
+`max`, `pow`, `round`, `int`, `float`, `bool`, `put`). By construction the model is
 never asked about:
 
 * control flow, assignment, operators, or any construct in the grammar

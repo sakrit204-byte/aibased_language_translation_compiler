@@ -70,7 +70,11 @@ def python_ground_truth(filename):
     has no import syntax for, so the preamble is supplied here.
     """
     source = read_program(filename)
-    preamble = "from math import *\n" if _is_ai(filename) else ""
+    # put() is a compiler builtin with no CPython equivalent — print always
+    # ends a line — so the oracle gets a one-line shim for it.
+    preamble = "import sys\ndef put(s): sys.stdout.write(s)\n"
+    if _is_ai(filename):
+        preamble += "from math import *\n"
     result = subprocess.run(
         [sys.executable, "-c", preamble + source + "\nmain()\n"],
         capture_output=True, text=True, timeout=60,
