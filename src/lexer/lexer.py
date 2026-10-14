@@ -300,6 +300,24 @@ class Lexer:
         s = ""
         while self.peek().isalnum() or self.peek() == "_":
             s += self.advance()
+
+        # Catch an import before anything else on the line can fail. Scanning
+        # `from pygame.locals import *` left to right, the first thing that
+        # breaks is the dot, so the error used to complain about attribute
+        # access — true, but not the point. The problem is the import.
+        if s in ("import", "from") and not self.line_has_tokens:
+            self.error(
+                f"'{s}' — this subset has no imports, so no library can be "
+                f"brought in.\n"
+                f"  For maths, just call the function directly: sqrt(x), "
+                f"sin(x), floor(x). The compiler has no rule for those names, "
+                f"so with --ai it asks the model for a C translation and "
+                f"proves it compiles before using it.\n"
+                f"  Libraries like pygame or numpy cannot be translated at "
+                f"all: they need arrays, objects and callbacks, none of which "
+                f"this subset can express.",
+                start_line)
+
         self.emit("KEYWORD" if s in KEYWORDS else "NAME", s, start_line, start_col)
 
     def _read_string(self):

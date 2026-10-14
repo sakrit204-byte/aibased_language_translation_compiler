@@ -131,3 +131,32 @@ def test_dedent_to_an_unknown_level_is_an_error():
     source = "def f() -> int:\n        x = 1\n    return x\n"
     with pytest.raises(LexError, match="does not match any outer"):
         Lexer(source).tokenize()
+
+
+@pytest.mark.parametrize("source", [
+    "from pygame.locals import *\n",
+    "import pygame\n",
+    "import math\n",
+    "from math import sqrt, sin\n",
+])
+def test_imports_are_reported_as_imports_not_as_a_stray_dot(source):
+    """Scanning `from pygame.locals import *` left to right, the first thing
+    that breaks is the dot — true, but not the point. The error has to name
+    the import."""
+    with pytest.raises(LexError) as excinfo:
+        Lexer(source).tokenize()
+    message = str(excinfo.value)
+    assert "no imports" in message
+    assert "attribute access" not in message
+
+
+def test_import_as_an_ordinary_name_is_still_allowed():
+    """Only a line that *starts* with import or from is an import. The words
+    are not keywords in this subset, so they remain usable as names."""
+    toks = Lexer("def f() -> int:\n    import_count = 1\n    return import_count\n").tokenize()
+    assert any(t.kind == "NAME" and t.value == "import_count" for t in toks)
+
+
+def test_a_real_attribute_access_still_says_attribute_access():
+    with pytest.raises(LexError, match="attribute access"):
+        Lexer("def f() -> int:\n    return obj.field\n").tokenize()
