@@ -95,21 +95,30 @@ def is_ollama_model(model):
 
 # --------------------------------------------------------------- transport
 
-def _openrouter_call(model, prompt, timeout, max_tokens):
+def _openrouter_call(model, prompt, timeout, max_tokens, reasoning=False):
     key = api_key()
     if not key:
         raise AIClientError(
             "No OpenRouter API key. Set OPENROUTER_API_KEY, or put the key in "
             "secrets/openrouter_key.txt (already excluded by .gitignore)."
         )
-    payload = json.dumps({
+    body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "top_p": 1,
         "seed": SEED,
         "max_tokens": max_tokens,
-    }).encode()
+    }
+    if not reasoning:
+        # Reasoning tokens are drawn from the same budget as the answer, so a
+        # model that deliberates can spend the whole allowance and return an
+        # empty string. Simplifying a 1000-line C file, Claude Haiku burned all
+        # 6000 tokens thinking and wrote nothing; with reasoning off the same
+        # request produced 10k tokens of C in half the time. These are
+        # mechanical transformations — there is nothing to deliberate about.
+        body["reasoning"] = {"enabled": False}
+    payload = json.dumps(body).encode()
     request = urllib.request.Request(
         OPENROUTER_URL, data=payload,
         headers={
@@ -121,8 +130,14 @@ def _openrouter_call(model, prompt, timeout, max_tokens):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:400]
-        raise _http_error(e.code, model, body) from e
+        detail = e.read().decode(errors="replace")[:400]
+        # Some models require reasoning and reject the flag outright
+        # ("Reasoning is mandatory for this model"). Retry once as asked,
+        # since refusing to answer at all is worse than a slower answer.
+        if e.code == 400 and not reasoning and "reasoning" in detail.lower():
+            return _openrouter_call(model, prompt, timeout, max_tokens,
+                                    reasoning=True)
+        raise _http_error(e.code, model, detail) from e
     except (urllib.error.URLError, OSError) as e:
         raise AIClientError(f"Could not reach OpenRouter ({e}).") from e
     except json.JSONDecodeError as e:
@@ -174,7 +189,8 @@ def _ollama_call(model, prompt, timeout, max_tokens):
 
 # ------------------------------------------------------------------- query
 
-def query(prompt, model=None, timeout=60, trace=None, max_tokens=256):
+def query(prompt, model=None, timeout=60, trace=None, max_tokens=256,
+          reasoning=False):
     """Send `prompt` to the model and return its raw text reply.
 
     `trace`, if given, is a list that receives one dict per provider attempt —
@@ -199,7 +215,8 @@ def query(prompt, model=None, timeout=60, trace=None, max_tokens=256):
         for attempt in range(1, attempts + 1):
             started = time.time()
             try:
-                text = _openrouter_call(endpoint, prompt, timeout, max_tokens)
+                text = _openrouter_call(endpoint, prompt, timeout, max_tokens,
+                                        reasoning)
                 if trace is not None:
                     trace.append({"endpoint": endpoint, "attempt": attempt, "ok": True,
                                   "seconds": round(time.time() - started, 2)})

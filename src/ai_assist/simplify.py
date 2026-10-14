@@ -36,7 +36,7 @@ from . import client
 from ..toolchain import compile_command, exe_suffix, find_c_compiler, run_env
 
 MAX_ATTEMPTS = 2
-SIMPLIFY_TOKEN_BUDGET = 6000
+SIMPLIFY_TOKEN_BUDGET = 16000
 RUN_TIMEOUT = 20
 
 # Only these headers may appear. The generated runtime needs no others, so
@@ -112,7 +112,8 @@ def check_safe(c_code):
     """Static check applied before the candidate is compiled or executed.
     Returns (ok, reason)."""
     if not c_code or not c_code.strip():
-        return False, "the model returned nothing"
+        return False, ("the model returned nothing — usually the token budget "
+                       "was exhausted before it wrote any output")
 
     code = code_only(c_code)
 

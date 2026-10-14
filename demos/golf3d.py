@@ -226,10 +226,19 @@ def surface_char(x: float, z: float, hx: float, hz: float, lit: float) -> str:
 # ----------------------------------------------------------------- camera
 
 def cam_height(hole: int) -> float:
+    """A slightly different vantage per hole, so they do not all look alike."""
+    if hole == 2:
+        return 8.6
+    if hole == 3:
+        return 6.8
     return 7.5
 
 
 def cam_back(hole: int) -> float:
+    if hole == 2:
+        return 16.5
+    if hole == 3:
+        return 13.5
     return 15.0
 
 
