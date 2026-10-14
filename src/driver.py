@@ -213,6 +213,10 @@ def main(argv=None):
     ap.add_argument("--ai-log", default=DEFAULT_AI_LOG, help="AI invocation log path")
     ap.add_argument("--ai-cache", default=DEFAULT_AI_CACHE,
                     help="verified-translation cache path")
+    ap.add_argument("--simplify", action="store_true",
+                    help="after translating, ask the model to simplify the C and "
+                         "keep its answer only if both versions produce identical "
+                         "output")
     ap.add_argument("--run", action="store_true",
                     help="build the C with the detected compiler and run it")
     ap.add_argument("--emit-stdout", action="store_true", help="print the C instead of writing it")
@@ -237,6 +241,17 @@ def main(argv=None):
     except CompileError as e:
         print(f"{args.source}: {e}", file=sys.stderr)
         return 1
+
+    if args.simplify:
+        from .ai_assist.simplify import simplify
+        before = c_code.count("\n")
+        c_code, report = simplify(c_code, model=args.model, log_path=args.ai_log)
+        if report["accepted"]:
+            print(f"simplified {before} -> {report['simplified_lines']} lines; "
+                  f"{report['reason']}")
+        else:
+            print(f"simplification rejected, original kept: {report['reason']}",
+                  file=sys.stderr)
 
     if args.emit_stdout:
         print(c_code)
