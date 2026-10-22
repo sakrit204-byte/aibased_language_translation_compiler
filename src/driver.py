@@ -249,6 +249,14 @@ def main(argv=None):
     ap.add_argument("--check", action="store_true",
                     help="survey everything in the file this subset cannot "
                          "translate, instead of stopping at the first one")
+    ap.add_argument("--repair", action="store_true",
+                    help="if translation fails, ask the model to rewrite the "
+                         "program into the subset, and keep its answer only if "
+                         "the compiled result prints exactly what the original "
+                         "prints under CPython")
+    ap.add_argument("--repair-out",
+                    help="where to write an accepted repair "
+                         "(default: <source>.repaired.py)")
     args = ap.parse_args(argv)
 
     if args.ai and args.no_ai:
@@ -274,7 +282,11 @@ def main(argv=None):
         )
     except CompileError as e:
         print(f"{args.source}: {e}", file=sys.stderr)
-        return 1
+        if not args.repair:
+            return 1
+        source, c_code, stats, results = _repair(args, source, str(e))
+        if source is None:
+            return 1
 
     if args.simplify:
         from .ai_assist.simplify import simplify
@@ -315,6 +327,71 @@ def main(argv=None):
         sys.stderr.write(err_text)
         return code
     return 0
+
+
+#: The same messages are shown in the IDE, where the real punctuation reads
+#: better, and on a Windows console, where cp1252 cannot encode it and Python
+#: falls back to printing `→` in the middle of a sentence.
+_PUNCTUATION = {"…": "...", "—": "-", "–": "-", "→": "->",
+                "‘": "'", "’": "'", "“": '"', "”": '"'}
+
+
+def _plain(text):
+    """`text` with typographic punctuation replaced, for a console that may
+    not be able to encode it."""
+    for fancy, plain in _PUNCTUATION.items():
+        text = text.replace(fancy, plain)
+    try:
+        encoding = sys.stderr.encoding or "utf-8"
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        text = text.encode("ascii", "replace").decode("ascii")
+    return text
+
+
+def _repair(args, source, error):
+    """Run the source-level repair after a failed translation.
+
+    Returns (repaired_source, c_code, stats, results), or four Nones when
+    nothing was accepted. The repaired program is written out so the diff is
+    reviewable rather than something the compiler quietly used.
+    """
+    from .ai_assist.repair import repair as repair_source
+
+    def progress(stage, text, ok):
+        mark = {True: "  ok ", False: "  no ", None: "  .. "}[ok]
+        print(f"{mark}{stage}: {_plain(text)}", file=sys.stderr)
+
+    print("\nattempting an AI repair of the source\n", file=sys.stderr)
+    repaired, report = repair_source(
+        source, error=error, model=args.model, log_path=args.ai_log,
+        progress=progress,
+    )
+    if not repaired:
+        print(_plain(f"\nno repair accepted: {report['reason']}"), file=sys.stderr)
+        return None, None, None, None
+
+    out = args.repair_out or os.path.splitext(args.source)[0] + ".repaired.py"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(repaired)
+
+    import difflib
+    print("\n--- what changed ---", file=sys.stderr)
+    for line in difflib.unified_diff(
+            source.splitlines(), repaired.splitlines(),
+            fromfile=args.source, tofile=out, lineterm="", n=2):
+        print(line, file=sys.stderr)
+    print("\n--- what was compared ---", file=sys.stderr)
+    reference = report.get("reference") or {}
+    print(f"target: {reference.get('bytes')} bytes, exit {reference.get('exit')}, "
+          f"sha256 {str(reference.get('sha256', ''))[:16]}...", file=sys.stderr)
+    for label, detail in report.get("checks", ()):
+        print(f"  {label:<38} {detail}", file=sys.stderr)
+    print(_plain(f"\nrepair accepted: {report['reason']}"), file=sys.stderr)
+    print(f"wrote {out}", file=sys.stderr)
+
+    c_code, stats, results = compile_source_detailed(repaired)
+    return repaired, c_code, stats, results
 
 
 if __name__ == "__main__":

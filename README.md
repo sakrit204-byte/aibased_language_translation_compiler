@@ -58,6 +58,19 @@ CPython, including a fuzz run of `repr()` over 800 random doubles.
 The rule is: **AI is the extension mechanism for names the compiler does not
 know, never a substitute for a rule it should have.**
 
+There are three places the model can be consulted, and each one is bounded by
+something that checks its answer rather than by trust:
+
+| Where | What it is asked | What decides |
+| --- | --- | --- |
+| the gate, `gate.py` | one C expression for one unknown call | a structural safety check, then a real C compiler |
+| Simplify, `simplify.py` | tidier C for a successful translation | both binaries run, stdout and exit compared |
+| Repair, `repair.py` | a rewrite of a program that will not compile | the whole compiler, then four runs compared byte for byte |
+
+The gate is the only one inside the pipeline; the other two sit outside it and
+can only ever propose. None of them can produce output that was not checked
+against something the model did not write.
+
 A call reaches `src/ai_assist/gate.py` only if the semantic phase tagged it
 `kind == "ai"`, which happens only when the callee is neither defined in the
 program nor one of the builtins with a static C rule (`len`, `abs`, `min`,
@@ -163,6 +176,100 @@ The rejection is the interesting one: the model dropped a `%` from a `printf`
 format string. The result compiled cleanly and looked fine. Only running it
 caught the corruption.
 
+## Repair: when the byte-for-byte translation cannot be made
+
+Simplify works on a translation that succeeded. **Repair** is for the other
+case — the program does not compile at all, because it uses an f-string, a
+comprehension, `enumerate`, `.items()`, a tuple unpack, or anything else the
+subset has no rule for.
+
+`--repair` on the CLI, or the **✦ Repair** button in the IDE, asks the model to
+rewrite the *program* into the subset. The rewrite then goes through the whole
+compiler — lexer, parser, semantic analysis, codegen — exactly as a hand-written
+program would. Nothing is special-cased for it, and the model's text never
+reaches the C compiler: only the C that *this compiler* emitted is ever built.
+
+```
+python -m src.driver demos/repair_me.py --repair --run
+```
+
+### What has to be true before a repair is accepted
+
+Five things, in order, and all five:
+
+1. **The original agrees with itself.** It is run twice before anything else
+   happens. A program that uses the clock, randomness, or anything else that
+   varies has no fixed output to preserve, and matching one of its runs would
+   say nothing about the next — so it is refused here, before a single token is
+   spent.
+2. **The rewrite compiles.** Not "looks plausible": the real pipeline accepts
+   it, which means every construct in it has a deterministic C rule. If it does
+   not, the compiler's own diagnostic goes back to the model and it tries again.
+3. **The rewrite, under CPython, prints what the original printed.** This is
+   safe to run only at this point, because compiling has *proved* the program
+   is inside a subset with no syntax for opening a file, starting a process or
+   reaching the network.
+4. **The generated C builds.**
+5. **That binary, run twice, prints what the original printed** — both times.
+
+"Prints what it printed" means the **raw bytes** of stdout and the exit status.
+Every run is captured as bytes, never as text: `subprocess.run(text=True)`
+translates CRLF to LF on both sides of a comparison, so a real difference in
+line endings — or in stdout encoding — would compare equal. On Windows this is
+not hypothetical; the comparison there is of CRLF bytes on both sides, and it
+is checked rather than assumed.
+
+Steps 3 and 5 together are the point. If the rewrite *and* the compiled C both
+match the original, the model preserved the behaviour and the compiler
+translated it faithfully — and a mistake in one cannot be hidden by a matching
+mistake in the other, because neither of them produced the output they are
+being compared against.
+
+```
+your program under CPython, run twice   identical
+the rewrite under CPython               identical
+the compiled C, run 1                   identical
+the compiled C, run 2                   identical
+```
+
+The one case where the argument does not hold is a program that prints nothing:
+matching "no output" is not evidence. The report marks that `vacuous` and says
+so rather than showing a tick.
+
+### The comparison window
+
+In the IDE a failed translation opens the repair window: the program that did
+not compile on the left with its error line marked, the accepted rewrite on the
+right, the two aligned line for line so an unchanged line sits on the same row
+on both sides. Replaced lines are tinted on the left, their replacements on the
+right. Underneath is the evidence — the error that stopped the compiler, the
+stage that rejected each attempt, the output both programs produce, and the
+four runs that were compared.
+
+**Use this repair** puts the rewrite in the source pane and translates it again
+as an ordinary translation. It is never applied silently.
+
+### When repair is refused
+
+A refusal is a real answer about the program, not a failure of the model:
+
+```
+Not repairable — the original program does not finish on its own (it was still
+running after 20s), so it has no finite output to preserve. A program that opens
+a window or waits for events cannot be repaired into this subset: there is
+nothing to compare a rewrite against.
+```
+
+A program that needs a growable list, dynamic dispatch, or a library the
+generated C has no binding to gets the same answer by a different route: every
+rewrite either fails to compile or prints something else, and all three attempts
+are reported with the stage that rejected them.
+
+`tests/test_repair.py` covers all of this with the model stubbed out, so it runs
+offline — including that a program which does not agree with itself is refused
+*without* a model call, and that a difference in line endings alone is still
+reported as a difference.
+
 ## Architecture
 
 ```
@@ -199,7 +306,7 @@ Three analyses run per function in the semantic phase:
 | `src/parser/` | recursive-descent parser and AST nodes |
 | `src/semantic/` | symbol table, type checker, builtin type rules |
 | `src/codegen/` | AST → C rules, the emitter, and the C runtime prelude |
-| `src/ai_assist/` | gate (policy), multi-provider client, safety + compiler validator, verified simplifier |
+| `src/ai_assist/` | gate (policy), multi-provider client, safety + compiler validator, verified simplifier, verified source repair |
 | `src/toolchain.py` | finds whichever C compiler is installed |
 | `src/driver.py` | CLI and pipeline orchestration |
 | `gui.py` | the IDE |
@@ -214,16 +321,26 @@ highlight the offending source line.
 
 Standard-library tkinter only; no third-party packages.
 
+When a translation fails and AI-assist is on, the IDE opens the **repair
+comparison window**: the program that did not compile on the left, the verified
+rewrite on the right, aligned line for line, with the four compared runs
+underneath. See *Repair*, above.
+
 * `Ctrl+Enter` translate · `F5` run the C · `Ctrl+S` save · `Ctrl+O` open ·
   `Ctrl+L` clear the console
 
 ## What's out of scope
 
-Classes, growable lists, dicts/sets/tuples, comprehensions, slicing, decorators, lambdas,
-generators, exceptions, closures, nested functions, chained assignment and
-comparison, default and keyword arguments, string concatenation and
-formatting. These are rejected by the grammar with a message that says so, not
-silently mishandled.
+Growable lists, sets, tuples, comprehensions, slicing, decorators, lambdas,
+generators, exceptions, inheritance, closures, nested functions, chained
+assignment and comparison, default and keyword arguments, string concatenation
+and formatting. These are rejected by the grammar with a message that says so,
+not silently mishandled — and `--repair` will offer to rewrite a program that
+uses them, if its behaviour can be reproduced without them.
+
+Fixed-size lists, fixed-key dicts and classes-as-structs **are** supported; what
+each gives up — `append`, new keys, a base class — is the part that would need
+an allocator or a table of function pointers.
 
 Imports are accepted, but only for the two modules in
 `src/semantic/modules.py` — see below. Anything else is refused by name with

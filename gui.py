@@ -653,6 +653,453 @@ class EditorPane(tk.Frame):
 # │  APPLICATION                                                             │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 
+def _as_comment(text, width=74):
+    """Wrap prose into Python comment lines, so it can stand in a code pane
+    without running off the edge of a view that does not wrap."""
+    import textwrap
+
+    lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            lines.append("#")
+            continue
+        lines.extend("# " + piece for piece in textwrap.wrap(paragraph, width))
+    return "\n".join(lines) + "\n"
+
+
+def _aligned(before, after):
+    """Pad two versions with blank rows so equal lines sit on the same row.
+
+    A unified diff reads well in a log and badly next to the code it describes.
+    Padding is what lets the two programs be read across: line 14 on the left
+    is line 14's replacement on the right, and a blank row is a line one side
+    does not have.
+
+    Returns (left_rows, right_rows, left_tags, right_tags, left_numbers).
+    `left_numbers` maps each displayed row back to its line in the original, so
+    the compiler's error can still be pointed at after padding.
+    """
+    import difflib
+
+    a, b = before.splitlines(), after.splitlines()
+    left, right, left_tags, right_tags, numbers = [], [], [], [], []
+
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                left.append(a[i1 + k])
+                right.append(b[j1 + k])
+                left_tags.append(None)
+                right_tags.append(None)
+                numbers.append(i1 + k + 1)
+            continue
+        for k in range(max(i2 - i1, j2 - j1)):
+            has_left = i1 + k < i2
+            has_right = j1 + k < j2
+            left.append(a[i1 + k] if has_left else "")
+            right.append(b[j1 + k] if has_right else "")
+            left_tags.append("removed" if has_left else "filler")
+            right_tags.append("added" if has_right else "filler")
+            numbers.append(i1 + k + 1 if has_left else None)
+
+    return left, right, left_tags, right_tags, numbers
+
+
+class RepairWindow(tk.Toplevel):
+    """The left/right comparison of a failed translation and its repair.
+
+    A window of its own rather than another bottom tab, for two reasons: the
+    two programs have to be readable side by side at full height, and what is
+    on screen is a *claim* — that this rewrite does what the original did — so
+    the evidence for it belongs next to it. The lower console carries that
+    evidence: the error that stopped the compiler, the stage that rejected each
+    attempt, and the output comparison that accepted the one that passed.
+
+    Nothing here decides anything. The window reports what src/ai_assist/
+    repair.py already established by compiling the rewrite and running it.
+    """
+
+    def __init__(self, app, source, error):
+        super().__init__(app.root)
+        self.app = app
+        self.source = source
+        self.error = error or ""
+        self.repaired = None
+        self.report = None
+        self._syncing = False
+        self._buttons = []
+
+        self.title("AI repair — the failure on the left, the resolve on the right")
+        self.geometry("1540x920")
+        self.minsize(960, 600)
+        self.transient(app.root)
+
+        self.sync_var = tk.BooleanVar(value=True)
+        self.verdict_var = tk.StringVar(value="Working…")
+
+        self._build_band()
+        self._build_panes()
+        self._build_log()
+        self._build_footer()
+        self.apply_theme()
+
+        self.left.set_text(source)
+        line = _line_from_message(self.error)
+        if line:
+            self.left.mark_error(line)
+        self.right.set_text(
+            "# The repair will appear here.\n"
+            "#\n"
+            "# It is only shown once it has been through the whole compiler and\n"
+            "# the C it produced has printed exactly what your program prints.\n")
+
+        self.write("The translation failed here\n", "head")
+        self.write(self.error.rstrip() + "\n\n", "err")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    # -- layout ---------------------------------------------------------
+
+    def _build_band(self):
+        self.band = tk.Frame(self, height=70)
+        self.band.pack(fill="x")
+        self.band.pack_propagate(False)
+
+        self.verdict_label = tk.Label(self.band, textvariable=self.verdict_var,
+                                      font=self.app.font_ui_bold, anchor="w",
+                                      padx=16, pady=4, justify="left")
+        self.verdict_label.pack(fill="x", pady=(10, 0))
+
+        self.band_note = tk.Label(
+            self.band, anchor="w", padx=16, justify="left",
+            font=self.app.font_small,
+            text="Nothing on the right is accepted unless it compiles AND the raw "
+                 "bytes it prints — from CPython and from the compiled C, twice "
+                 "— are identical to your program's.")
+        self.band_note.pack(fill="x")
+
+    def _build_panes(self):
+        self.split = tk.PanedWindow(self, orient="vertical", sashwidth=6,
+                                    sashrelief="flat", borderwidth=0)
+        self.split.pack(fill="both", expand=True)
+
+        top = tk.Frame(self.split)
+        self.panes = tk.PanedWindow(top, orient="horizontal", sashwidth=6,
+                                    sashrelief="flat", borderwidth=0)
+        self.panes.pack(fill="both", expand=True)
+
+        self.left = EditorPane(self.panes, self.app, "Original — did not compile",
+                               "Python", readonly=True)
+        self.panes.add(self.left, minsize=320, stretch="always")
+        self.right = EditorPane(self.panes, self.app, "Repair — not verified yet",
+                                "Python", readonly=True)
+        self.panes.add(self.right, minsize=320, stretch="always")
+        self.split.add(top, minsize=240, stretch="always")
+
+        self._link_scrolling()
+        for pane in (self.left, self.right):
+            pane.text.tag_configure("removed")
+            pane.text.tag_configure("added")
+            pane.text.tag_configure("filler")
+
+        # Re-centre on resize: a split that is half the window at 1540px is not
+        # half of it after the window is dragged wider, and a comparison with
+        # one side cut off is not a comparison.
+        self._sash_width = 0
+        self.panes.bind("<Configure>", self._on_panes_resize)
+        self.after(140, self._balance)
+
+    def _on_panes_resize(self, _event=None):
+        width = self.panes.winfo_width()
+        if abs(width - self._sash_width) > 2:
+            self._sash_width = width
+            self._balance()
+
+    def _build_log(self):
+        holder = tk.Frame(self.split)
+        self.log = tk.Text(holder, wrap="word", borderwidth=0, relief="flat",
+                           padx=12, pady=10, font=self.app.font_small_mono,
+                           state="disabled", height=12)
+        bar = ThinScrollbar(holder, self.log.yview, self.app.theme)
+        self.log_bar = bar
+        self.log.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self.log.pack(fill="both", expand=True)
+        self.split.add(holder, minsize=120, height=260)
+
+    def _build_footer(self):
+        self.footer = tk.Frame(self, height=50)
+        self.footer.pack(fill="x", side="bottom")
+        self.footer.pack_propagate(False)
+
+        self.sync_switch = Switch(self.footer, "Lock scrolling", self.sync_var,
+                                  self.app.theme, font=self.app.font_small)
+        self.sync_switch.pack(side="left", padx=16, pady=12)
+
+        self.close_button = self._button("Close", self.close)
+        self.close_button.pack(side="right", padx=(4, 16), pady=10)
+        self.apply_button = self._button("Use this repair", self.apply_repair,
+                                         kind="primary", padx=16, pady=7)
+        self.apply_button.pack(side="right", padx=4, pady=10)
+        self.save_button = self._button("Save as…", self.save_repair)
+        self.save_button.pack(side="right", padx=4, pady=10)
+        for button in (self.apply_button, self.save_button):
+            button.set_enabled(False)
+
+    def _button(self, text, command, kind="ghost", padx=12, pady=6):
+        button = FlatButton(self.footer, text, command, self.app.theme, kind=kind,
+                            padx=padx, pady=pady, font=self.app.font_small)
+        self._buttons.append(button)
+        return button
+
+    def _balance(self):
+        try:
+            width = self.panes.winfo_width()
+            if width > 100:
+                self.panes.sash_place(0, width // 2, 1)
+        except tk.TclError:
+            pass
+
+    def _link_scrolling(self):
+        """Scroll both panes together, so the same row is on screen on both
+        sides. Without this the comparison is two documents, not one."""
+        def make(pane, other):
+            def handler(first, last):
+                pane.vbar.set(first, last)
+                pane.gutter.redraw()
+                if self._syncing or not self.sync_var.get():
+                    return
+                self._syncing = True
+                try:
+                    other.text.yview_moveto(float(first))
+                    other.gutter.redraw()
+                finally:
+                    self._syncing = False
+            return handler
+
+        self.left.text.configure(yscrollcommand=make(self.left, self.right))
+        self.right.text.configure(yscrollcommand=make(self.right, self.left))
+
+    # -- theming --------------------------------------------------------
+
+    def apply_theme(self):
+        t = self.app.theme
+        self.configure(bg=t["bg"])
+        for frame in (self.band, self.footer):
+            frame.configure(bg=t["bg"])
+        self.split.configure(bg=t["border"])
+        self.panes.configure(bg=t["border"])
+        self.verdict_label.configure(bg=t["bg"], fg=t["fg"])
+        self.band_note.configure(bg=t["bg"], fg=t["dim"])
+        self.left.apply_theme(t)
+        self.right.apply_theme(t)
+        self.app._style_console(self.log)
+        self.log_bar.apply_theme(t, "console")
+        self.sync_switch.apply_theme(t)
+        for button in self._buttons:
+            button.apply_theme(t)
+        for pane in (self.left, self.right):
+            pane.text.tag_configure("removed", background=t["errline"])
+            pane.text.tag_configure("added", background=t["addline"])
+            pane.text.tag_configure("filler", background=t["raised"])
+        self._set_verdict(self.verdict_var.get(), getattr(self, "_tone", "dim"))
+
+    def _set_verdict(self, text, tone):
+        self._tone = tone
+        self.verdict_var.set(text)
+        try:
+            self.verdict_label.configure(fg=self.app.theme.get(tone,
+                                                               self.app.theme["fg"]))
+        except tk.TclError:
+            pass
+
+    # -- console --------------------------------------------------------
+
+    def write(self, text, tag=""):
+        try:
+            self.log.configure(state="normal")
+            self.log.insert("end", text, tag)
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    # -- progress and result --------------------------------------------
+
+    STAGE_WORDS = {
+        "reference": "the original's own output",
+        "model": "asking the model",
+        "safety": "pre-compiler check",
+        "compile": "the compiler",
+        "build": "the C compiler",
+        "verify": "comparing the output",
+    }
+
+    def on_progress(self, stage, text, ok):
+        label = self.STAGE_WORDS.get(stage, stage)
+        mark = {True: "  ✓ ", False: "  ✗ ", None: "  · "}[ok]
+        tone = {True: "ok", False: "err", None: "dim"}[ok]
+        self.write(f"{mark}{label}: {text}\n", tone)
+        if ok is None:
+            self._set_verdict(f"Working — {label}: {text}", "warn")
+
+    def show_result(self, repaired, report):
+        self.repaired = repaired
+        self.report = report
+        self.right.title_label.configure(
+            text="Repair — verified" if repaired else "Repair — none accepted")
+
+        if report.get("blocked"):
+            self._set_verdict("Not repairable — and that is an answer about the "
+                              "program, not a failure of the model", "err")
+            self.write("\n" + "─" * 70 + "\n", "dim")
+            self.write("Repair was not attempted\n", "head")
+            self.write(report["blocked"] + "\n", "err")
+            self.right.set_text(_as_comment("No repair was attempted.\n\n"
+                                            + report["blocked"]))
+            return
+
+        self._write_attempts(report)
+
+        if not repaired:
+            self._set_verdict("No repair accepted — the original is unchanged", "err")
+            candidate = self._last_candidate(report)
+            if candidate:
+                self.write("\nThe last rewrite it proposed, and why it was "
+                           "refused:\n\n", "dim")
+                self._show_sides(candidate)
+                self.right.title_label.configure(text="Repair — REJECTED")
+            else:
+                self.right.set_text("# The model produced nothing usable.\n")
+            self.write(report.get("reason", "") + "\n", "err")
+            return
+
+        vacuous = report.get("vacuous")
+        self._set_verdict(
+            ("Repaired, but the comparison proves little — see below"
+             if vacuous else "Repaired and verified byte for byte — your program, "
+                             "the rewrite and the compiled C all print the same "
+                             "bytes"),
+            "warn" if vacuous else "ok")
+        self._show_sides(repaired)
+        for button in (self.apply_button, self.save_button):
+            button.set_enabled(True)
+
+        self.write("\n" + "─" * 70 + "\n", "dim")
+        self.write("Verdict\n", "head")
+        self.write("  " + report.get("reason", "") + "\n",
+                   "warn" if vacuous else "ok")
+        self._write_output_evidence(report)
+
+    def _last_candidate(self, report):
+        for attempt in reversed(report.get("attempts", [])):
+            if attempt.get("candidate"):
+                return attempt["candidate"]
+        return None
+
+    def _write_attempts(self, report):
+        self.write("\n" + "─" * 70 + "\n", "dim")
+        self.write("Every attempt, and where each one stopped\n", "head")
+        self.write("  A rewrite is put through the lexer, the parser, the type\n"
+                   "  checker and codegen like any other program. Nothing is\n"
+                   "  special-cased for it.\n\n", "dim")
+        for attempt in report.get("attempts", []):
+            ok = attempt.get("ok")
+            stage = self.STAGE_WORDS.get(attempt.get("stage"), attempt.get("stage"))
+            head = f"  attempt {attempt.get('attempt')} — {stage}: "
+            if ok:
+                self.write(head + "accepted\n", "ok")
+            else:
+                self.write(head + "rejected\n", "err")
+                reason = str(attempt.get("reason", "")).strip()
+                for line in reason.splitlines()[:6]:
+                    self.write(f"      {line}\n", "dim")
+
+    def _write_output_evidence(self, report):
+        reference = report.get("reference") or {}
+        tone = "warn" if report.get("vacuous") else "ok"
+
+        # The output first, the evidence after it: the console scrolls to the
+        # end, so what should be on screen when it stops is the verdict's
+        # grounds, not the program's output.
+        out = reference.get("stdout") or ""
+        if out.strip():
+            self.write("\nThe output both of them produce\n", "head")
+            shown = out if len(out) < 4000 else out[:4000] + "\n… (truncated)\n"
+            self.write(shown if shown.endswith("\n") else shown + "\n", "")
+
+        self.write("\nWhat was compared\n", "head")
+        self.write(
+            f"  The target: {reference.get('lines', '?')} line(s), "
+            f"{reference.get('bytes', '?')} bytes, exit {reference.get('exit', '?')}"
+            f"   sha256 {str(reference.get('sha256', ''))[:16]}…\n", "dim")
+        self.write(
+            "  Raw bytes, not decoded text: CRLF against LF, or two encodings of\n"
+            "  the same character, would otherwise compare equal.\n\n", "dim")
+        for label, detail in report.get("checks", []):
+            self.write(f"  {label:<38} {detail}\n", tone)
+        self.write(
+            "\n  Four agreeing runs, not one. The rewrite is run under CPython as\n"
+            "  well as compiled, so a mistake by the model and a matching mistake\n"
+            "  by the compiler cannot cancel out — neither of them produced the\n"
+            "  output they are being compared against.\n", "dim")
+
+    def _show_sides(self, repaired):
+        """Put the two programs on screen aligned, with the changes tinted."""
+        left_rows, right_rows, left_tags, right_tags, numbers = _aligned(
+            self.source, repaired)
+
+        self.left.set_text("\n".join(left_rows))
+        self.right.set_text("\n".join(right_rows))
+        for pane, tags in ((self.left, left_tags), (self.right, right_tags)):
+            for index, tag in enumerate(tags):
+                if tag:
+                    pane.text.tag_add(tag, f"{index + 1}.0", f"{index + 1}.end+1c")
+
+        error_line = _line_from_message(self.error)
+        if error_line and error_line in numbers:
+            self.left.mark_error(numbers.index(error_line) + 1)
+
+        removed = sum(1 for t in left_tags if t == "removed")
+        added = sum(1 for t in right_tags if t == "added")
+        self.left.title_label.configure(
+            text=f"Original — did not compile  ({removed} line(s) replaced)")
+        if self.repaired:
+            self.right.title_label.configure(
+                text=f"Repair — verified  ({added} line(s) in their place)")
+        self.write(f"\n{removed} line(s) replaced by {added}; the rest is "
+                   f"untouched and is shown on the same row.\n", "dim")
+
+    # -- actions --------------------------------------------------------
+
+    def apply_repair(self):
+        if not self.repaired:
+            return
+        self.app.accept_repair(self.repaired, self.report)
+        self.close()
+
+    def save_repair(self):
+        if not self.repaired:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension=".py",
+            initialfile=self.app._base_name() + "_repaired.py",
+            filetypes=[("Python", "*.py"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.repaired)
+        except OSError as error:
+            messagebox.showerror("Save failed", str(error), parent=self)
+            return
+        self.write(f"\nsaved {path}\n", "ok")
+
+    def close(self):
+        if self.app.repair_window is self:
+            self.app.repair_window = None
+        self.destroy()
+
+
 class TranslationCompilerApp:
     STAGES = [
         ("lexer", "Lexer"),
@@ -699,6 +1146,12 @@ class TranslationCompilerApp:
         # the text in the output pane, which does not say so by itself.
         self.last_link = {"sources": [], "flags": []}
         self.last_source = ""
+        # The last translation that failed, and the diagnostic that stopped it.
+        # Repair needs both: the program to rewrite, and the error to hand the
+        # model so it is not guessing at what was wrong.
+        self.failed_source = ""
+        self.last_error = ""
+        self.repair_window = None
 
         # A model name saved by an older build may no longer be valid — the
         # project moved from Ollama to OpenRouter, and sending "qwen2.5-coder:7b"
@@ -761,6 +1214,11 @@ class TranslationCompilerApp:
         self._refresh_history_ui()
         self.theme_button.configure(text="☀  Light" if self.theme_name == "dark"
                                     else "☾  Dark")
+        if self.repair_window is not None:
+            try:
+                self.repair_window.apply_theme()
+            except tk.TclError:
+                self.repair_window = None
 
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
@@ -852,6 +1310,11 @@ class TranslationCompilerApp:
                                                  kind="primary", padx=18, pady=7,
                                                  font=self.font_ui_bold)
         self.translate_button.pack(side="left", padx=8, pady=8)
+
+        # Only useful after a translation has failed, so it says so rather than
+        # being greyed out with no explanation.
+        self.repair_button = self._add_button(bar, "✦  Repair", self.repair_source)
+        self.repair_button.pack(side="left", padx=2, pady=10)
 
         self.theme_button = self._add_button(bar, "☀  Light", self.toggle_theme)
         self.theme_button.pack(side="right", padx=(4, 14), pady=10)
@@ -1206,6 +1669,127 @@ class TranslationCompilerApp:
                         f"identical", "ok")
 
     # ------------------------------------------------------------------
+    #  REPAIR  (the source-level counterpart of Simplify)
+    # ------------------------------------------------------------------
+
+    def repair_source(self):
+        """When the byte-for-byte translation cannot be made, ask the model to
+        rewrite the program into the subset — and show both side by side.
+
+        The rewrite goes through the whole compiler, and its answer is kept
+        only if the C it produced prints exactly what the original prints under
+        CPython. This method only starts that and opens the window; everything
+        it reports was decided in src/ai_assist/repair.py.
+        """
+        if self.busy:
+            return
+        source = self.failed_source or self.source_pane.get_text()
+        if not source.strip():
+            self.set_status("Nothing to repair — write or open some Python", "warn")
+            return
+        if not self.failed_source:
+            self.set_status("Translate first: repair works on a translation that "
+                            "failed, and needs its error to work from", "warn")
+            return
+        if not self.c_compiler:
+            self.show_tab("terminal")
+            self._write_terminal(
+                "Repair needs a C compiler: a rewrite is only accepted once its C "
+                "has been built and run and its output compared against yours.\n"
+                + install_hint() + "\n", "err")
+            return
+        if self.repair_window is not None:
+            try:
+                self.repair_window.lift()
+                return
+            except tk.TclError:
+                self.repair_window = None
+
+        self.busy = True
+        self.translate_button.set_enabled(False)
+        self.repair_button.set_enabled(False)
+        self.set_status("Repairing: rewriting into the subset, then verifying the "
+                        "output is identical…")
+        window = RepairWindow(self, source, self.last_error)
+        self.repair_window = window
+        threading.Thread(target=self._repair_worker,
+                         args=(source, self.last_error, self.model_var.get(), window),
+                         daemon=True).start()
+
+    def _repair_worker(self, source, error, model, window):
+        from src.ai_assist.repair import repair
+
+        log_path = os.path.join(REPORTS_DIR, "ai_invocation_log.md")
+
+        def progress(stage, text, ok):
+            self.root.after(0, lambda: self._repair_progress(window, stage, text, ok))
+
+        try:
+            repaired, report = repair(source, error=error, model=model,
+                                      log_path=log_path,
+                                      use_ai=bool(self.ai_var.get()),
+                                      progress=progress)
+        except Exception as error_obj:
+            message = f"{type(error_obj).__name__}: {error_obj}"
+            self.root.after(0, lambda: self._on_repair_failed(window, message))
+            return
+        self.root.after(0, lambda: self._on_repair_done(window, repaired, report))
+
+    def _repair_progress(self, window, stage, text, ok):
+        try:
+            window.on_progress(stage, text, ok)
+        except tk.TclError:
+            pass                       # the window was closed mid-run
+
+    def _finish_repair(self):
+        self.busy = False
+        self.translate_button.set_enabled(True)
+        self.repair_button.set_enabled(True)
+
+    def _on_repair_failed(self, window, message):
+        self._finish_repair()
+        self.set_status("Repair failed — your program is unchanged", "err")
+        try:
+            window.write(f"\nrepair failed: {message}\n", "err")
+            window._set_verdict("Repair failed — your program is unchanged", "err")
+        except tk.TclError:
+            pass
+
+    def _on_repair_done(self, window, repaired, report):
+        self._finish_repair()
+        try:
+            window.show_result(repaired, report)
+        except tk.TclError:
+            pass
+        if report.get("blocked"):
+            self.set_status("Not repairable: " + report["blocked"].splitlines()[0][:90],
+                            "err")
+        elif repaired:
+            self.set_status("✦ Repaired and verified — press 'Use this repair' to "
+                            "take it", "ok")
+        else:
+            self.set_status("No repair accepted — nothing was changed", "warn")
+
+    def accept_repair(self, repaired, report):
+        """Take the repaired program into the editor and translate it.
+
+        The repair is not applied silently: it lands in the source pane as
+        editable text, and the translation that follows is an ordinary one, so
+        what ends up in the C pane went through the same path as anything else.
+        """
+        self.source_pane.set_text(repaired)
+        self.failed_source = ""
+        self.last_error = ""
+        self.show_tab("terminal")
+        self._write_terminal("\n$ repair accepted\n", "cmd")
+        self._write_terminal((report or {}).get("reason", "") + "\n", "ok")
+        self._write_terminal(
+            "The repaired program is now in the source pane. Translating it "
+            "again is an ordinary translation — nothing about it is special.\n",
+            "dim")
+        self.translate()
+
+    # ------------------------------------------------------------------
     #  EXTRACT AS FILE
     # ------------------------------------------------------------------
 
@@ -1379,6 +1963,8 @@ class TranslationCompilerApp:
     def _on_failure(self, message, results):
         self._finish()
         self.pipeline = results
+        self.failed_source = self.source_pane.get_text()
+        self.last_error = message
         # Clear any C left from an earlier, successful run. Leaving it on
         # screen next to a failed translation reads as though this program
         # produced it.
@@ -1400,6 +1986,29 @@ class TranslationCompilerApp:
         # compiler and unhelpful when there are seventy. Survey the rest, so
         # the whole picture is on screen instead of one error per attempt.
         self._append_survey()
+        self._offer_repair()
+
+    def _offer_repair(self):
+        """The failed translation is the one case where the model has something
+        to offer: a rewrite into the subset. Start it when AI-assist is on."""
+        if not self.c_compiler:
+            self._append_detail(
+                "\n\nA repair could be attempted here, but it needs a C compiler: "
+                "a rewrite is only accepted once its C has been built and run.\n",
+                "dim")
+            return
+        if self.ai_var.get():
+            self._append_detail(
+                "\n\nAI-assist is on — asking the model to rewrite this into the "
+                "subset. The comparison window will open with the original on the "
+                "left and the rewrite on the right.\n", "warn")
+            self.root.after(200, self.repair_source)
+        else:
+            self._append_detail(
+                "\n\nPress ✦ Repair (or switch AI-assist on and translate again) to "
+                "have the model rewrite this into the subset. Its answer is shown "
+                "beside yours and is kept only if the C it compiles to prints "
+                "exactly what your program prints.\n", "dim")
 
     def _append_survey(self):
         try:

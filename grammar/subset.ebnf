@@ -9,7 +9,26 @@
 (* itself is the correctness oracle for the generated C.                *)
 (* ------------------------------------------------------------------ *)
 
-program        = { import_stmt | function_def } ;
+program        = { import_stmt | class_def | function_def } ;
+
+(* ------------------------------------------------------------------ *)
+(* A class is a value type: a C struct, and free functions that take a *)
+(* pointer to it. No vtable, no refcount, no base class — calling a    *)
+(* method through a base would be dynamic dispatch, dispatch needs a   *)
+(* table of function pointers, and a function is not a value here.     *)
+(*                                                                     *)
+(* A field declared without a value is storage in the struct and must  *)
+(* be assigned by __init__; one declared with a value is a constant    *)
+(* shared by the class, not a per-instance field.                      *)
+(* ------------------------------------------------------------------ *)
+
+class_def      = "class" IDENT ":" NEWLINE INDENT [ STRING NEWLINE ]
+                 { class_member } DEDENT ;
+class_member   = field_decl | constant_decl | method_def | pass_stmt ;
+field_decl     = IDENT ":" type NEWLINE ;
+constant_decl  = IDENT ":" type "=" expression NEWLINE ;
+method_def     = "def" IDENT "(" "self" { "," param } ")" "->" type ":" block ;
+                 (* `self` is implicit in the C signature, not a value *)
 
 (* ------------------------------------------------------------------ *)
 (* An import binds names; it never executes a module. There is no      *)
@@ -81,6 +100,7 @@ block          = NEWLINE INDENT [ STRING NEWLINE ] { statement } DEDENT ;
 
 statement      = assign_stmt
                | index_assign_stmt
+               | attribute_assign_stmt
                | aug_assign_stmt
                | if_stmt
                | while_stmt
@@ -95,6 +115,11 @@ statement      = assign_stmt
 assign_stmt    = IDENT [ ":" type ] "=" expression NEWLINE ;
                  (* the annotation form pins a variable's type, e.g.
                     `total: float = 0` so that `total = total / n` is legal *)
+
+attribute_assign_stmt = IDENT "." IDENT [ "[" expression "]" ]
+                        "=" expression NEWLINE ;
+                 (* self.count = 0, self.cells[i] = v. The receiver must be a
+                    name bound to an instance, not an arbitrary expression. *)
 
 aug_assign_stmt = IDENT aug_op expression NEWLINE ;
 aug_op         = "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" ;
@@ -136,8 +161,14 @@ index_assign_stmt = IDENT "[" expression "]" [ "+" | "-" | "*" | "/" | "%" ]
 
 atom           = NUMBER | FLOAT | STRING
                | "True" | "False" | "None"
-               | call_expr | module_const | index_expr
-               | IDENT | "(" expression ")" ;
+               | call_expr | method_call | module_const | class_const
+               | index_expr | attribute | IDENT | "(" expression ")" ;
+
+attribute      = IDENT "." IDENT ;
+                 (* self.count, cube.size -- a field of an instance *)
+method_call    = IDENT "." IDENT "(" [ arg_list ] ")" ;
+class_const    = IDENT "." IDENT ;
+                 (* Cube.SIZE -- a constant declared in a class body *)
 
 index_expr     = IDENT "[" expression "]" ;
                  (* a negative index counts from the end, as Python's does, *)
@@ -145,12 +176,12 @@ index_expr     = IDENT "[" expression "]" ;
                  (* reading whatever C would find at that address.          *)
 
 call_expr      = [ IDENT "." ] IDENT "(" [ arg_list ] ")" ;
-                 (* the qualified form is only valid on an imported module *)
+                 (* the qualified form is an imported module or a method *)
 
 module_const   = IDENT "." IDENT ;
-                 (* math.pi and friends. A dot is legal only on a name an  *)
-                 (* import bound; on anything else it is attribute access, *)
-                 (* which this subset cannot express.                      *)
+                 (* math.pi and friends. A dot is legal on a name an       *)
+                 (* import bound, on an instance, and on a class; on       *)
+                 (* anything else there is nothing for it to mean.         *)
 arg_list       = expression { "," expression } [ "," ] ;
 
 (* ------------------------------------------------------------------ *)
@@ -172,16 +203,25 @@ arg_list       = expression { "," expression } [ "," ] ;
 (* ------------------------------------------------------------------ *)
 (* Deliberately excluded, and rejected with a message that says so:     *)
 (*                                                                      *)
-(*   classes, lists/dicts/sets/tuples, comprehensions, slicing,         *)
-(*   decorators, lambdas, generators, exceptions, imports, closures,    *)
-(*   nested defs, global/nonlocal, multiple or chained assignment,      *)
-(*   chained comparison (a < b < c), string concatenation and           *)
-(*   formatting, default and keyword arguments, while/else, for/else.   *)
+(*   sets, tuples, comprehensions, slicing, decorators, lambdas,        *)
+(*   generators, exceptions, closures, nested defs, global/nonlocal,    *)
+(*   inheritance, multiple or chained assignment, chained comparison    *)
+(*   (a < b < c), string concatenation and formatting (f-strings,       *)
+(*   str(), %, .format), default and keyword arguments, *args/**kwargs, *)
+(*   while/else, for/else, and any for-loop that is not over range().   *)
+(*                                                                      *)
+(* Lists, dicts and classes are IN, in the fixed-size forms above: an   *)
+(* array whose length is part of its type, a dict whose key set is, and *)
+(* a class that is a struct. What each of them gives up — append, new   *)
+(* keys, a base class — is the part that would need an allocator or a   *)
+(* function pointer.                                                    *)
 (*                                                                      *)
 (* String concatenation and str() are excluded specifically because     *)
 (* they need heap allocation; the generated C has no allocator and no   *)
 (* ownership model, and half-implementing one would be worse than       *)
-(* saying no.                                                           *)
+(* saying no. put() is how a line is composed instead: it writes a      *)
+(* string with no newline, so the pieces are written rather than        *)
+(* joined.                                                              *)
 (* ------------------------------------------------------------------ *)
 
 (* Documented behavioural limits of the generated C:                    *)
