@@ -172,10 +172,15 @@ void gfx_camera(double ex, double ey, double ez,
     if (len < 1e-9) return;
     fx /= len; fy /= len; fz /= len;
 
-    /* right = forward x worldUp, with worldUp = (0,1,0) */
-    rx = fz * 1.0 - 0.0;
+    /* right = forward x worldUp, with worldUp = (0,1,0), which is
+     * (-fz, 0, fx). This had the sign the other way round, making `right`
+     * point left and, through up = right x forward, `up` point down — a
+     * view mirrored on both axes. A spinning symmetric cube looks identical
+     * either way, which is why it survived until something with a
+     * distinguishable top and right was drawn. */
+    rx = -fz;
     ry = 0.0;
-    rz = -fx;
+    rz = fx;
     len = sqrt(rx * rx + rz * rz);
     if (len < 1e-9) { rx = 1.0; ry = 0.0; rz = 0.0; }
     else { rx /= len; rz /= len; }

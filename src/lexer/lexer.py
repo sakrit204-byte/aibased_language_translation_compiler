@@ -54,7 +54,7 @@ OPERATORS_1 = {
 UNSUPPORTED = {
     "{": "dict/set syntax",
     "}": "dict/set syntax",
-    "@": "decorators",
+
     ";": "multiple statements on one line",
     "&": "bitwise operators",
     "|": "bitwise operators",
@@ -163,6 +163,14 @@ class Lexer:
 
             if self._read_operator():
                 continue
+
+            if ch == "@":
+                self.error(
+                    "'@' (decorator) is not part of this Python subset. A decorator "
+                    "is a function that takes a function and returns a function, and "
+                    "this subset has no function values — a name here is a number, a "
+                    "string or an array, never a function."
+                )
 
             if ch in UNSUPPORTED:
                 self.error(f"{ch!r} ({UNSUPPORTED[ch]}) is not part of this Python subset")
@@ -299,6 +307,23 @@ class Lexer:
         s = ""
         while self.peek().isalnum() or self.peek() == "_":
             s += self.advance()
+
+        # Catch a class before anything else on the line can fail — the same
+        # problem the import diagnostic has. Scanning a class-based program
+        # left to right, the first character with no translation is usually
+        # the `@` of a decorator a few lines *below* the `class` line, so the
+        # error used to name decorators. True, but not the point: the program
+        # is built from classes, and no decorator fix would help.
+        if s == "class" and not self.line_has_tokens:
+            self.error(
+                "'class' — this subset has functions and numbers, no classes.\n"
+                "  There is nothing to translate a class into: the generated C has "
+                "no allocator, so an object has nowhere to live, and no vtable, so "
+                "a method call has nothing to dispatch on.\n"
+                "  A program here is top-level functions over int, float, str, bool "
+                "and fixed-size arrays. State that would be an object's fields goes "
+                "in an array the functions are passed.",
+                start_line)
 
         self.emit("KEYWORD" if s in KEYWORDS else "NAME", s, start_line, start_col)
 

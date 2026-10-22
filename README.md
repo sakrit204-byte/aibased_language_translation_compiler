@@ -379,6 +379,19 @@ def main() -> int:
 `demos/cube3d.py` is a fuller version of that — a lit, rotating cube in a
 real window, with arrow-key camera control.
 
+`demos/rubik3d.py` is the one that puts both halves together: a Rubik's cube
+you can turn, in a window. Arrays hold the 54 stickers and the permutation
+table, `gfx` draws them, and the whole thing compiles with no AI gate
+involved:
+
+```
+$ python -m src.driver demos/rubik3d.py --run
+call sites: 69   AI-resolved: 0   model queries: 0   (AI-assist disabled)
+linking shims: gfx
+```
+
+W Y G B R O turn a face, 1-6 turn it back, space scrambles, arrows orbit.
+
 **Everything else is refused by name, with the reason.** The reason is never
 the import syntax; it is that the module's API hands back something the subset
 has no way to hold:
