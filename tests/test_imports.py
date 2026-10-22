@@ -318,17 +318,18 @@ def test_an_unknown_module_says_what_is_importable():
 # ------------------------------------------------------- dots are still rare
 
 def test_attribute_access_on_a_value_is_still_rejected():
-    """The dot now reaches the parser, so this error has to be re-made there
-    — and it should still name attribute access, not mention imports."""
-    with pytest.raises(ParseError) as excinfo:
+    """The dot reaches the semantic phase now that classes exist, because
+    that is the first stage that knows whether the owner is an instance. The
+    error still has to name attribute access and point somewhere useful."""
+    with pytest.raises(SemanticError) as excinfo:
         check("def main() -> int:\n    return obj.field\n")
     message = str(excinfo.value)
     assert "attribute access" in message
-    assert "no objects here" in message
+    assert "import math" in message
 
 
 def test_a_dot_on_a_name_that_is_not_a_module_is_attribute_access():
-    with pytest.raises(ParseError, match="attribute access"):
+    with pytest.raises(SemanticError, match="no objects here"):
         check(
             "import math\n"
             "def main() -> int:\n"
@@ -343,7 +344,7 @@ def test_a_module_member_cannot_be_nested_deeper():
 
 
 def test_the_dot_suggestion_names_a_working_example():
-    with pytest.raises(ParseError, match="import math"):
+    with pytest.raises(SemanticError, match="import math"):
         check("def main() -> int:\n    return obj.field\n")
 
 

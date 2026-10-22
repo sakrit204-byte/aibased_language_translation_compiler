@@ -12,6 +12,7 @@ KEYWORDS = {
     "and", "or", "not", "True", "False", "None",
     "break", "continue", "pass",
     "import", "from", "as",
+    "class",
 }
 
 # Names that are valid as a type annotation.

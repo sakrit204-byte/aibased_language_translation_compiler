@@ -15,6 +15,22 @@ from dataclasses import dataclass, field
 class Program:
     functions: list
     imports: list = field(default_factory=list)
+    classes: list = field(default_factory=list)
+
+
+@dataclass
+class ClassDef:
+    """A class: typed fields, literal constants and methods.
+
+    No base class, because dispatching through one needs a vtable and this
+    subset has no function values. See semantic/classes.py.
+    """
+    name: str
+    fields: list          # list[(name, type, line)]
+    constants: list       # list[(name, type, value_node, line)]
+    methods: list         # list[FunctionDef], __init__ among them
+    line: int
+    docstring: str = None
 
 
 @dataclass
@@ -185,6 +201,72 @@ class Call:
     kind: str = None          # "user" | "builtin" | "module" | "ai"
     ai_expr: str = None       # the validated C expression, when kind == "ai"
     member: object = None     # modules.Member, when kind == "module"
+
+
+@dataclass
+class Attribute:
+    """`obj.field` or `self.field` — resolved by the semantic phase, which
+    is the first stage that knows whether `obj` is an instance."""
+    owner: str
+    member: str
+    line: int
+    inferred_type: str = None
+    kind: str = None          # "field" | "constant"
+    class_name: str = None
+
+
+@dataclass
+class AttributeAssign:
+    """`obj.field = value`, and the augmented forms."""
+    owner: str
+    member: str
+    value: object
+    line: int
+    op: str = None
+    class_name: str = None
+
+
+@dataclass
+class AttributeIndex:
+    """`obj.field[i]` — reading an element of an array field."""
+    owner: str
+    member: str
+    index: object
+    line: int
+    inferred_type: str = None
+    class_name: str = None
+
+
+@dataclass
+class AttributeIndexAssign:
+    """`obj.field[i] = value`."""
+    owner: str
+    member: str
+    index: object
+    value: object
+    line: int
+    op: str = None
+    class_name: str = None
+
+
+@dataclass
+class MethodCall:
+    """`obj.method(args)`."""
+    owner: str
+    method: str
+    args: list
+    line: int
+    inferred_type: str = None
+    class_name: str = None
+
+
+@dataclass
+class New:
+    """`Cube()` — only ever an initialiser, like an array literal."""
+    class_name: str
+    args: list
+    line: int
+    inferred_type: str = None
 
 
 @dataclass

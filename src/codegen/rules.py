@@ -12,6 +12,7 @@ import re
 
 from ..parser import ast_nodes as A
 from ..semantic import arrays
+from ..semantic import classes
 
 C_TYPE = {
     "int": "py_int",
@@ -50,6 +51,8 @@ class CodegenError(Exception):
 
 
 def type_to_c(t):
+    if classes.is_instance(t):
+        return classes.class_of(t) + " *"
     if arrays.is_array(t):
         return C_TYPE[arrays.element(t)] + " *"
     try:
@@ -132,8 +135,14 @@ class CodegenRules:
         # the emitter before each one, because an array's length depends on
         # which function it is declared in.
         self.local_types = {}
+        # Parameters of the function being emitted. An object parameter is
+        # already a pointer in C; an object local is storage, so a call on it
+        # needs its address.
+        self.param_names = set()
         # name -> the symbol table's entry, for the parameter types.
         self.functions = {}
+        # name -> classes.ClassInfo, for field offsets and method symbols.
+        self.class_info = {}
         # Maps a Python function name to the C symbol the emitter gave it.
         # `main` needs special handling: C's entry point has a fixed signature.
         self.func_name = func_name
@@ -141,6 +150,8 @@ class CodegenRules:
     # ------------------------------------------------------------ dispatch
 
     def expr(self, node) -> str:
+        if type(node).__name__ == "_Rendered":
+            return node.text
         if isinstance(node, A.Num):
             return c_float_literal(node.value) if node.is_float else c_int_literal(node.value)
         if isinstance(node, A.Str):
@@ -150,9 +161,22 @@ class CodegenRules:
         if isinstance(node, A.Name):
             if node.member is not None:          # a module constant: math.pi
                 return node.member.render([])
+            if classes.is_instance(self.local_types.get(node.id, "")):
+                return self.receiver(node.id)
             return c_name(node.id)
         if isinstance(node, A.Index):
             return f"{c_name(node.name)}[{self.index_expr(node)}]"
+        if isinstance(node, A.Attribute):
+            if node.kind == "constant":
+                return self.class_constant(node.class_name, node.member)
+            return self.field(node.owner, node.member)
+        if isinstance(node, A.AttributeIndex):
+            target = self.field(node.owner, node.member)
+            self.request("py_index")
+            length = self.field_length(node.class_name, node.member)
+            return f"{target}[py_index({self.expr(node.index)}, {length})]"
+        if isinstance(node, A.MethodCall):
+            return self.method_call(node)
         if isinstance(node, A.BinOp):
             return self.binop(node)
         if isinstance(node, A.UnaryOp):
@@ -250,6 +274,60 @@ class CodegenRules:
             return f"(strcmp({left}, {right}) {node.op} 0)"
         return f"({left} {node.op} {right})"
 
+    # ------------------------------------------------------------- classes
+
+    def receiver(self, owner):
+        """How to pass `owner` where a pointer to an object is wanted."""
+        if owner in self.param_names:
+            return c_name(owner) if owner != "self" else "self"
+        return f"&{c_name(owner)}"
+
+    def field(self, owner, member):
+        """`self->count` or `c.count`.
+
+        `self` is a pointer because a method must be able to mutate the
+        caller's instance; a local is storage, so it uses a dot.
+        """
+        if owner in self.param_names:
+            base = "self" if owner == "self" else c_name(owner)
+            return f"{base}->{c_name(member)}"
+        return f"{c_name(owner)}.{c_name(member)}"
+
+    def field_length(self, class_name, member):
+        info = self.class_info[class_name]
+        return str(arrays.size(info.fields[member].type))
+
+    def class_constant(self, class_name, member):
+        """A class constant is shared, so it is inlined rather than stored."""
+        info = self.class_info[class_name]
+        return self.expr(info.constants[member].value)
+
+    def method_call(self, node):
+        """`c.turn(f)` -> `Cube__turn(&c, f)`, and `self.turn(f)` ->
+        `Cube__turn(self, f)` because self is already a pointer."""
+        receiver = self.receiver(node.owner)
+        info = self.class_info[node.class_name]
+        method = info.methods[node.method]
+        args = [self.expr(a) for a in node.args]
+        out = [receiver]
+        for param, arg_node, rendered in zip(method.params[1:], node.args, args):
+            if classes.is_instance(param.type):
+                if not isinstance(arg_node, A.Name):
+                    raise CodegenError(
+                        f"line {node.line}: an object argument must be a plain name"
+                    )
+                out.append(self.receiver(arg_node.id))
+                continue
+            out.append(rendered)
+            if arrays.is_array(param.type):
+                if not isinstance(arg_node, A.Name):
+                    raise CodegenError(
+                        f"line {node.line}: an array argument must be a plain name"
+                    )
+                out.append(self.array_length(arg_node.id))
+        return "%s(%s)" % (classes.method_symbol(node.class_name, node.method),
+                           ", ".join(out))
+
     # -------------------------------------------------------------- arrays
 
     def index_expr(self, node):
@@ -308,6 +386,16 @@ class CodegenRules:
             return args
         out = []
         for (_, param_type), arg_node, rendered in zip(entry["params"], node.args, args):
+            if classes.is_instance(param_type):
+                # An object parameter is a pointer, so the caller passes the
+                # address — except `self`, which is already one. Python passes
+                # the same object either way, which is the point.
+                if not isinstance(arg_node, A.Name):
+                    raise CodegenError(
+                        f"line {node.line}: an object argument must be a plain name"
+                    )
+                out.append(self.receiver(arg_node.id))
+                continue
             out.append(rendered)
             if arrays.is_array(param_type):
                 if not isinstance(arg_node, A.Name):

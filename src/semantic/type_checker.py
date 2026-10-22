@@ -35,6 +35,7 @@ can route it through the gate. See src/ai_assist/gate.py.
 from ..parser import ast_nodes as A
 from .symbol_table import SymbolTable, SemanticError
 from . import arrays
+from . import classes
 from . import modules
 from .builtins import (
     BUILTINS, BuiltinError, assignable, check_call, is_numeric, join,
@@ -64,6 +65,8 @@ class TypeChecker:
         self.module_aliases = {}        # alias -> modules.Module
         self.imported = {}              # local name -> (Module, Member)
         self.profiles = []              # profiles.Profile, in import order
+        self.classes = {}               # name -> classes.ClassInfo
+        self.current_class = None       # set while checking a method body
         self.ai_calls = []          # Call nodes tagged kind="ai", in source order
         self.call_sites = 0         # every call site, for an honest AI-usage rate
         self.env = {}
@@ -76,6 +79,7 @@ class TypeChecker:
 
     def check(self, program: A.Program):
         self._check_imports(program)
+        self._check_classes(program)
 
         for fn in program.functions:
             if arrays.is_array(fn.return_type):
@@ -192,6 +196,317 @@ class TypeChecker:
                 f"line {main['line']}: main() must be declared -> int or -> None, "
                 f"not -> {main['return_type']}"
             )
+
+    def _check_new(self, stmt):
+        """`c: Cube = Cube()` — the one place an object comes into being."""
+        node = stmt.value
+        info = self.classes.get(node.class_name)
+        if info is None:
+            raise SemanticError(
+                f"line {stmt.line}: there is no class '{node.class_name}'"
+            )
+        declared = stmt.declared_type
+        if declared is None:
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' is given a {info.name}, so it must "
+                f"be annotated: `{stmt.name}: {info.name} = {info.name}(...)`"
+            )
+        if classes.class_of(declared) != info.name:
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' is declared "
+                f"{classes.describe(declared)} but is given a {info.name}"
+            )
+        if stmt.name in self.defined:
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' already holds an object and cannot "
+                f"be replaced with another. An object here is storage, not a "
+                f"reference that can be repointed."
+            )
+
+        expected = info.init.params[1:]
+        arg_types = [self._infer(a) for a in node.args]
+        if len(expected) != len(arg_types):
+            raise SemanticError(
+                f"line {stmt.line}: {info.name}() takes {len(expected)} "
+                f"argument(s), got {len(arg_types)}"
+            )
+        for i, (param, actual) in enumerate(zip(expected, arg_types), 1):
+            if not assignable(actual, param.type):
+                raise SemanticError(
+                    f"line {stmt.line}: argument {i} of {info.name}() "
+                    f"({param.name}) is {arrays.describe(param.type)}, got "
+                    f"{arrays.describe(actual)}"
+                )
+        node.inferred_type = declared
+        self.symtab.declare_var(stmt.name, declared, stmt.line)
+        self.defined.add(stmt.name)
+
+    def _check_attribute_assign(self, stmt):
+        info = self._class_of_owner(stmt.owner, stmt.line)
+        kind, thing = self._member(info, stmt.member, stmt.line, stmt.owner)
+        stmt.class_name = info.name
+
+        if kind == "method":
+            raise SemanticError(
+                f"line {stmt.line}: '{info.name}.{stmt.member}' is a method and "
+                f"cannot be assigned to"
+            )
+        if kind == "constant":
+            raise SemanticError(
+                f"line {stmt.line}: '{info.name}.{stmt.member}' is a class constant "
+                f"and is shared by every instance, so it cannot be assigned to"
+            )
+
+        indexed = isinstance(stmt, A.AttributeIndexAssign)
+        if indexed:
+            if not arrays.is_array(thing.type):
+                raise SemanticError(
+                    f"line {stmt.line}: '{info.name}.{stmt.member}' is "
+                    f"{arrays.describe(thing.type)}, not an array"
+                )
+            index_type = self._infer(stmt.index)
+            if index_type not in ("int", "bool"):
+                raise SemanticError(
+                    f"line {stmt.line}: an array index must be an int, not "
+                    f"{index_type}"
+                )
+            target_type = arrays.element(thing.type)
+        else:
+            target_type = thing.type
+
+        if arrays.is_array(target_type):
+            value_type = target_type
+        else:
+            value_type = self._infer(stmt.value)
+            if stmt.op:
+                value_type = self._binop_type(stmt.op, target_type, value_type,
+                                              stmt.value, stmt.line)
+
+        if arrays.is_array(target_type):
+            # The one exception: __init__ fills the array, which is exactly
+            # what Python does there — a fresh list per instance.
+            in_init = (self.current_fn is not None
+                       and self.current_fn.name == "__init__"
+                       and stmt.owner == "self")
+            if not in_init:
+                raise SemanticError(
+                    f"line {stmt.line}: '{info.name}.{stmt.member}' is an array and "
+                    f"is storage, not a reference — assign to its elements instead, "
+                    f"e.g. `{stmt.owner}.{stmt.member}[i] = ...`.\n  Only __init__ "
+                    f"may fill it as a whole."
+                )
+            if not isinstance(stmt.value, (A.ArrayLit, A.ArrayRepeat)):
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.member}' must be filled with an array "
+                    f"literal here, e.g. `[0] * {arrays.size(target_type)}`"
+                )
+            count = (stmt.value.count if isinstance(stmt.value, A.ArrayRepeat)
+                     else len(stmt.value.elements))
+            if count != arrays.size(target_type):
+                raise SemanticError(
+                    f"line {stmt.line}: '{info.name}.{stmt.member}' is declared with "
+                    f"{arrays.size(target_type)} elements but is filled with {count}"
+                )
+            element = (stmt.value.element if isinstance(stmt.value, A.ArrayRepeat)
+                       else stmt.value.elements[0])
+            got = self._literal_element_type(element, stmt.line)
+            if got != arrays.element(target_type):
+                raise SemanticError(
+                    f"line {stmt.line}: '{info.name}.{stmt.member}' holds "
+                    f"{arrays.element(target_type)} but is filled with {got} values"
+                )
+            stmt.value.inferred_type = target_type
+            return
+        if indexed:
+            if value_type != target_type:
+                raise SemanticError(
+                    f"line {stmt.line}: '{info.name}.{stmt.member}' holds "
+                    f"{target_type}, so {value_type} cannot be stored in it"
+                )
+        elif not assignable(value_type, target_type):
+            raise SemanticError(
+                f"line {stmt.line}: '{info.name}.{stmt.member}' is "
+                f"{arrays.describe(target_type)}, so {arrays.describe(value_type)} "
+                f"cannot be stored in it"
+            )
+
+    # ------------------------------------------------------------ classes
+
+    def _check_classes(self, program: A.Program):
+        """Register every class, then check its methods like functions.
+
+        A method is an ordinary function whose first parameter is a pointer
+        to the instance; see semantic/classes.py. Registering all classes
+        before checking any body means a method may mention a class defined
+        further down the file.
+        """
+        for node in getattr(program, "classes", ()):
+            if node.name in self.classes:
+                first = self.classes[node.name].line
+                raise SemanticError(
+                    f"line {node.line}: class '{node.name}' is already defined at "
+                    f"line {first}"
+                )
+            if node.name in RESERVED_NAMES or node.name in ("int", "float",
+                                                            "str", "bool", "list"):
+                raise SemanticError(
+                    f"line {node.line}: '{node.name}' is a builtin name and cannot "
+                    f"be a class"
+                )
+            info = classes.ClassInfo(node.name, node.line)
+
+            for field_name, field_type, line in node.fields:
+                if classes.is_instance(field_type):
+                    raise SemanticError(
+                        f"line {line}: field '{field_name}' is another object. A "
+                        f"field here is a number, a string or an array — an object "
+                        f"holding an object would need a pointer, and this subset "
+                        f"has no references."
+                    )
+                if arrays.is_array(field_type) and arrays.size(field_type) is None:
+                    raise SemanticError(
+                        f"line {line}: array field '{field_name}' needs its length "
+                        f"in the annotation, e.g. "
+                        f"`{field_name}: list[{arrays.element(field_type)}, 9]` — it "
+                        f"is storage inside the struct, so the size is part of the "
+                        f"type. Fill it in __init__."
+                    )
+                info.fields[field_name] = classes.Field(field_name, field_type, line)
+
+            for const_name, const_type, value, line in node.constants:
+                if arrays.is_array(const_type):
+                    raise SemanticError(
+                        f"line {line}: `{const_name}: list[...] = [...]` in a class "
+                        f"body makes ONE list shared by every instance — writing "
+                        f"through one object would change all of them. That is "
+                        f"Python's behaviour and it is almost never what is "
+                        f"wanted.\n  Declare the size in the annotation and fill it "
+                        f"in __init__ instead:\n"
+                        f"      {const_name}: list[{arrays.element(const_type)}, N]\n"
+                        f"      def __init__(self) -> None:\n"
+                        f"          self.{const_name} = [0] * N"
+                    )
+                if not isinstance(value, (A.Num, A.Str, A.Bool,
+                                          A.UnaryOp)):
+                    raise SemanticError(
+                        f"line {line}: a class constant must be a literal — it is "
+                        f"shared by every instance and is inlined where it is used"
+                    )
+                if const_name in info.fields:
+                    raise SemanticError(
+                        f"line {line}: '{const_name}' is already a field of "
+                        f"'{node.name}'"
+                    )
+                info.constants[const_name] = classes.Constant(
+                    const_name, const_type, value, line)
+
+            for method in node.methods:
+                if method.name in info.fields or method.name in info.constants:
+                    raise SemanticError(
+                        f"line {method.line}: '{method.name}' is already a member of "
+                        f"'{node.name}'"
+                    )
+                if not method.params or method.params[0].name != "self":
+                    raise SemanticError(
+                        f"line {method.line}: method '{node.name}.{method.name}' "
+                        f"needs `self` as its first parameter"
+                    )
+                if classes.is_instance(method.return_type):
+                    raise SemanticError(
+                        f"line {method.line}: '{node.name}.{method.name}' returns an "
+                        f"object. C would copy the struct where Python hands back the "
+                        f"same instance, so the two would part company the moment the "
+                        f"caller wrote to it.\n  Fill an object passed in as a "
+                        f"parameter instead — that is shared, not copied."
+                    )
+                if arrays.is_array(method.return_type):
+                    raise SemanticError(
+                        f"line {method.line}: '{node.name}.{method.name}' cannot "
+                        f"return an array"
+                    )
+                info.methods[method.name] = method
+                if method.name == "__init__":
+                    info.init = method
+
+            if info.init is None:
+                raise SemanticError(
+                    f"line {node.line}: class '{node.name}' needs an __init__, and it "
+                    f"has to assign every field. A C struct starts as whatever was on "
+                    f"the stack, and Python has no attribute at all until one is "
+                    f"assigned, so the two only agree if __init__ sets them."
+                )
+            if info.init.return_type != "None":
+                raise SemanticError(
+                    f"line {info.init.line}: __init__ must be declared -> None"
+                )
+            self.classes[node.name] = info
+
+        # Methods are registered under a mangled name so a call can be checked
+        # exactly like a call to a free function.
+        for name, info in self.classes.items():
+            for method_name, method in info.methods.items():
+                self.symtab.declare_function(
+                    classes.method_symbol(name, method_name),
+                    method.params, method.return_type, method.line)
+
+        for node in getattr(program, "classes", ()):
+            info = self.classes[node.name]
+            for method in node.methods:
+                self.current_class = info
+                self._check_function(
+                    method, symbol=classes.method_symbol(node.name, method.name))
+                self.current_class = None
+            self._check_init_assigns_every_field(info)
+
+    def _check_init_assigns_every_field(self, info):
+        assigned = set()
+        for stmt in _walk_stmts(info.init.body):
+            if isinstance(stmt, (A.AttributeAssign, A.AttributeIndexAssign)):
+                if stmt.owner == "self":
+                    assigned.add(stmt.member)
+        missing = [f for f in info.fields if f not in assigned]
+        if missing:
+            raise SemanticError(
+                f"line {info.init.line}: __init__ of '{info.name}' leaves "
+                f"{', '.join(repr(m) for m in missing)} unassigned. Every field has "
+                f"to be set here: an unset C struct member holds whatever was on the "
+                f"stack, while Python would not have the attribute at all."
+            )
+
+    def _class_of_owner(self, owner, line):
+        """The ClassInfo for the variable `owner`, or an error saying why not."""
+        t = (self.env or {}).get(owner)
+        if t is None and self.symtab.has_var(owner):
+            t = self.symtab.lookup_var(owner, line)
+        if t is None:
+            raise SemanticError(
+                f"line {line}: '{owner}' is not defined in this function, so "
+                f"'{owner}.…' is attribute access on nothing.\n  A dot is valid on "
+                f"an imported module (`import math` then `math.sqrt(x)`) or on a "
+                f"class instance (`c: Cube = Cube()` then `c.turn(0)`)."
+            )
+        if not classes.is_instance(t):
+            raise SemanticError(
+                f"line {line}: '{owner}' is {arrays.describe(t)}, not an object, so "
+                f"it has no attributes — this subset has no objects here to hold a "
+                f"field.\n  A dot is valid on an imported module (`import math` then "
+                f"`math.sqrt(x)`) or on a class instance."
+            )
+        return self.classes[classes.class_of(t)]
+
+    def _member(self, info, name, line, owner):
+        kind, thing = info.lookup(name)
+        if kind is None:
+            raise SemanticError(
+                f"line {line}: '{info.name}' has no member '{name}'.\n"
+                f"  It has: {', '.join(info.member_names())}."
+            )
+        if classes.is_private(name) and owner != "self":
+            raise SemanticError(
+                f"line {line}: '{name}' is private to '{info.name}' and cannot be "
+                f"read from outside it. Add a method that returns what is needed."
+            )
+        return kind, thing
 
     # ------------------------------------------------------------- arrays
 
@@ -344,10 +659,10 @@ class TypeChecker:
 
     # -------------------------------------------------- pass 2: full checking
 
-    def _check_function(self, fn: A.FunctionDef):
+    def _check_function(self, fn: A.FunctionDef, symbol=None):
         self.current_fn = fn
         local_types = self._collect_local_types(fn)
-        self.symtab.enter_function(fn.name, local_types)
+        self.symtab.enter_function(symbol or fn.name, local_types)
         self.env = local_types
         self.defined = {p.name for p in fn.params}
         self.loop_depth = 0
@@ -366,6 +681,9 @@ class TypeChecker:
 
     def _check_stmt(self, stmt, ret_type):
         if isinstance(stmt, A.Assign):
+            if isinstance(stmt.value, A.New):
+                self._check_new(stmt)
+                return
             if isinstance(stmt.value, (A.ArrayLit, A.ArrayRepeat)):
                 # Checked by _size_annotation during the pre-pass; the type is
                 # already on the statement, and inferring the literal here
@@ -400,6 +718,12 @@ class TypeChecker:
             declared = self.symtab.declare_var(stmt.name, t, stmt.line)
             stmt.declared_type = declared
             self.defined.add(stmt.name)
+
+        elif isinstance(stmt, (A.AttributeAssign, A.AttributeIndexAssign)):
+            self._check_attribute_assign(stmt)
+
+        elif isinstance(stmt, A.MethodCall):
+            self._infer(stmt)
 
         elif isinstance(stmt, A.IndexAssign):
             array_type = self._array_of(stmt.name, stmt.line)
@@ -606,6 +930,19 @@ class TypeChecker:
             t = self._infer_call(expr)
         elif isinstance(expr, A.Index):
             t = self._infer_index(expr)
+        elif isinstance(expr, A.Attribute):
+            t = self._infer_attribute(expr)
+        elif isinstance(expr, A.AttributeIndex):
+            t = self._infer_attribute_index(expr)
+        elif isinstance(expr, A.MethodCall):
+            t = self._infer_method_call(expr)
+        elif isinstance(expr, A.New):
+            raise SemanticError(
+                f"line {expr.line}: `{expr.class_name}()` may only initialise a "
+                f"variable declared `{expr.class_name}`, e.g. "
+                f"`c: {expr.class_name} = {expr.class_name}()`. An object here is "
+                f"storage, not a reference that can be moved around."
+            )
         elif isinstance(expr, (A.ArrayLit, A.ArrayRepeat)):
             raise SemanticError(
                 f"line {expr.line}: an array literal may only initialise a variable "
@@ -720,6 +1057,86 @@ class TypeChecker:
                 f"line {expr.line}: an array index must be an int, not {index_type}"
             )
         return arrays.element(array_type)
+
+    def _infer_attribute(self, expr: A.Attribute):
+        # `Counter.START` — a constant read through the class rather than an
+        # instance. Only a constant: a field needs an object to live in, and
+        # a method needs one to act on.
+        if expr.owner in self.classes and not (self.env or {}).get(expr.owner):
+            info = self.classes[expr.owner]
+            kind, thing = info.lookup(expr.member)
+            if kind != "constant":
+                raise SemanticError(
+                    f"line {expr.line}: '{expr.owner}.{expr.member}' is "
+                    f"{'not a member of ' + expr.owner if kind is None else 'a ' + kind}"
+                    f". Only a class constant can be read through the class itself; "
+                    f"a field or method needs an instance."
+                )
+            expr.kind = "constant"
+            expr.class_name = info.name
+            return thing.type
+
+        info = self._class_of_owner(expr.owner, expr.line)
+        kind, thing = self._member(info, expr.member, expr.line, expr.owner)
+        expr.class_name = info.name
+        if kind == "method":
+            raise SemanticError(
+                f"line {expr.line}: '{info.name}.{expr.member}' is a method; it "
+                f"needs parentheses to be called. A method is not a value here."
+            )
+        expr.kind = kind
+        return thing.type
+
+    def _infer_attribute_index(self, expr: A.AttributeIndex):
+        info = self._class_of_owner(expr.owner, expr.line)
+        kind, thing = self._member(info, expr.member, expr.line, expr.owner)
+        if kind != "field" or not arrays.is_array(thing.type):
+            raise SemanticError(
+                f"line {expr.line}: '{info.name}.{expr.member}' is "
+                f"{arrays.describe(getattr(thing, 'type', '?'))}, not an array, so "
+                f"it cannot be indexed"
+            )
+        index_type = self._infer(expr.index)
+        if index_type not in ("int", "bool"):
+            raise SemanticError(
+                f"line {expr.line}: an array index must be an int, not {index_type}"
+            )
+        expr.class_name = info.name
+        return arrays.element(thing.type)
+
+    def _infer_method_call(self, call: A.MethodCall):
+        info = self._class_of_owner(call.owner, call.line)
+        kind, method = self._member(info, call.method, call.line, call.owner)
+        if kind != "method":
+            raise SemanticError(
+                f"line {call.line}: '{info.name}.{call.method}' is a "
+                f"{'constant' if kind == 'constant' else 'field'}, not a method, so "
+                f"it cannot be called"
+            )
+        if call.method == "__init__":
+            raise SemanticError(
+                f"line {call.line}: __init__ runs when the object is created; it "
+                f"cannot be called again. A C struct is storage, so there is no "
+                f"second construction to perform."
+            )
+        arg_types = [self._infer(a) for a in call.args]
+        expected = method.params[1:]          # self is implicit
+        if len(expected) != len(arg_types):
+            raise SemanticError(
+                f"line {call.line}: '{info.name}.{call.method}' takes "
+                f"{len(expected)} argument(s), got {len(arg_types)}"
+            )
+        for i, (param, actual) in enumerate(zip(expected, arg_types), 1):
+            if not assignable(actual, param.type):
+                raise SemanticError(
+                    f"line {call.line}: argument {i} of '{info.name}.{call.method}' "
+                    f"({param.name}) is {arrays.describe(param.type)}, got "
+                    f"{arrays.describe(actual)}"
+                )
+        if not self.prepass:
+            self.call_sites += 1
+        call.class_name = info.name
+        return method.return_type
 
     # ------------------------------------------------------------- modules
 

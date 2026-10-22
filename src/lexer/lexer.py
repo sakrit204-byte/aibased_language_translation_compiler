@@ -308,23 +308,6 @@ class Lexer:
         while self.peek().isalnum() or self.peek() == "_":
             s += self.advance()
 
-        # Catch a class before anything else on the line can fail — the same
-        # problem the import diagnostic has. Scanning a class-based program
-        # left to right, the first character with no translation is usually
-        # the `@` of a decorator a few lines *below* the `class` line, so the
-        # error used to name decorators. True, but not the point: the program
-        # is built from classes, and no decorator fix would help.
-        if s == "class" and not self.line_has_tokens:
-            self.error(
-                "'class' — this subset has functions and numbers, no classes.\n"
-                "  There is nothing to translate a class into: the generated C has "
-                "no allocator, so an object has nowhere to live, and no vtable, so "
-                "a method call has nothing to dispatch on.\n"
-                "  A program here is top-level functions over int, float, str, bool "
-                "and fixed-size arrays. State that would be an object's fields goes "
-                "in an array the functions are passed.",
-                start_line)
-
         self.emit("KEYWORD" if s in KEYWORDS else "NAME", s, start_line, start_col)
 
     def _read_string(self):

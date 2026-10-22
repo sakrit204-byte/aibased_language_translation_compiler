@@ -101,7 +101,8 @@ def compile_source_detailed(source, use_ai=False, model=None, log_path=None,
         gate = Gate(model=model, log_path=log_path, cache_path=cache_path)
         resolver = gate.resolve
 
-    emitter = Emitter(symtab, ai_resolver=resolver, profiles=checker.profiles)
+    emitter = Emitter(symtab, ai_resolver=resolver, profiles=checker.profiles,
+                      class_info=checker.classes)
     try:
         c_code = emitter.emit_program(ast)
     except (CodegenError, AIAssistError) as e:

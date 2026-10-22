@@ -12,6 +12,7 @@ Two details that are easy to get wrong and are handled explicitly here:
 
 from . import ast_nodes as A
 from ..semantic import arrays
+from ..semantic import classes
 from ..lexer.tokens import TYPE_NAMES
 
 
@@ -49,6 +50,9 @@ class Parser:
         # because a dot is only legal after one of them: `math.sqrt` is a
         # module member, `point.x` is attribute access and still rejected.
         self.module_aliases = set()
+        # Classes declared so far, so `Cube(...)` is construction rather than
+        # a call to a function named Cube.
+        self.class_names = set()
 
     # ---- token helpers ----
 
@@ -92,12 +96,16 @@ class Parser:
     def parse_program(self):
         funcs = []
         imports = []
+        classes = []
         while not self.at("EOF"):
             if self.at("NEWLINE"):        # stray blank logical line
                 self.take()
                 continue
             if self.at_kw("import") or self.at_kw("from"):
                 imports.append(self.parse_import())
+                continue
+            if self.at_kw("class"):
+                classes.append(self.parse_class())
                 continue
             if not self.at_kw("def"):
                 t = self.cur()
@@ -107,9 +115,83 @@ class Parser:
                     f"code into a function (for example `def main() -> int:`)."
                 )
             funcs.append(self.parse_function())
-        if not funcs:
+        if not funcs and not classes:
             raise ParseError("empty program: define at least one function")
-        return A.Program(funcs, imports)
+        return A.Program(funcs, imports, classes)
+
+    # ---- classes ----
+
+    def parse_class(self):
+        """`class Name:` then fields, constants and methods.
+
+        A base class is refused here rather than later: calling a method
+        through a base-class name is dynamic dispatch, dispatch needs a
+        vtable, and a vtable is an array of function pointers — a function
+        value, which this subset has no way to hold.
+        """
+        line = self.eat("KEYWORD", "class").line
+        name = self.eat("NAME").value
+
+        if self.at("LPAREN"):
+            self.eat("LPAREN")
+            base = self.cur().value if self.at("NAME") else "..."
+            raise ParseError(
+                f"line {line}: `class {name}({base})` — inheritance is not part of "
+                f"this subset. Calling a method through a base class is dynamic "
+                f"dispatch, which needs a table of function pointers, and a function "
+                f"is not a value here.\n  A class on its own — fields and methods, "
+                f"no base — is supported."
+            )
+
+        self.class_names.add(name)
+        self.eat("COLON")
+        self.eat("NEWLINE")
+        self.eat("INDENT")
+
+        docstring = None
+        if self.at("STRING") and self.nxt().kind == "NEWLINE":
+            docstring = self.take().value
+            self.eat("NEWLINE")
+
+        fields = []
+        constants = []
+        methods = []
+
+        while not self.at("DEDENT") and not self.at("EOF"):
+            if self.at("NEWLINE"):
+                self.take()
+                continue
+            if self.at_kw("pass"):
+                self.take()
+                self.eat("NEWLINE")
+                continue
+            if self.at_kw("def"):
+                methods.append(self.parse_function(in_class=name))
+                continue
+            if self.at("NAME") and self.nxt().kind == "COLON":
+                member = self.eat("NAME").value
+                member_line = self.tokens[self.pos - 1].line
+                self.eat("COLON")
+                member_type = self.parse_type()
+                if self.at("ASSIGN"):
+                    self.eat("ASSIGN")
+                    constants.append((member, member_type,
+                                      self.parse_expression(), member_line))
+                else:
+                    fields.append((member, member_type, member_line))
+                self.eat("NEWLINE")
+                continue
+            t = self.cur()
+            raise ParseError(
+                f"line {t.line}: a class body holds annotated fields "
+                f"(`count: int`), literal constants (`SIZE: int = 3`) and methods. "
+                f"Found {t.kind} {t.value!r}."
+            )
+
+        self.eat("DEDENT")
+        if not fields and not constants and not methods:
+            raise ParseError(f"line {line}: class '{name}' is empty")
+        return A.ClassDef(name, fields, constants, methods, line, docstring)
 
     # ---- imports ----
 
@@ -184,12 +266,26 @@ class Parser:
             f"line {t.line}: unexpected {t.kind} {t.value!r} at the end of the {what}"
         )
 
-    def parse_function(self):
+    def parse_function(self, in_class=None):
         line = self.eat("KEYWORD", "def").line
         name = self.eat("NAME").value
         self.eat("LPAREN")
         params = []
         seen = set()
+        if in_class is not None and self.at("NAME") and self.cur().value == "self":
+            # `self` carries no annotation in Python and needs none here: its
+            # type is the class the method is written in.
+            self.pos += 1
+            seen.add("self")
+            params.append(A.Param("self", classes.make(in_class)))
+            if self.at("COMMA"):
+                self.eat("COMMA")
+            elif not self.at("RPAREN"):
+                t = self.cur()
+                raise ParseError(
+                    f"line {line}: expected ',' or ')' after `self`, found "
+                    f"{t.kind} {t.value!r}"
+                )
         if not self.at("RPAREN"):
             params.append(self.parse_param(seen))
             while self.at("COMMA"):
@@ -232,9 +328,13 @@ class Parser:
         if t.kind == "NAME" and t.value in TYPE_NAMES:
             self.pos += 1
             return t.value
+        if t.kind == "NAME" and t.value in self.class_names:
+            self.pos += 1
+            return classes.make(t.value)
         raise ParseError(
             f"line {t.line}: {t.value!r} is not a type in this subset "
-            f"(expected int, float, str, bool, None, or list[...])"
+            f"(expected int, float, str, bool, None, list[...], or a class "
+            f"defined above this point)"
         )
 
     def parse_array_type(self):
@@ -259,6 +359,26 @@ class Parser:
                 f"(expected one of {', '.join(sorted(ARRAY_ELEMENT_TYPES))})"
             )
         self.pos += 1
+        if self.at("COMMA"):
+            # `list[int, 54]` — a size in the annotation. Not a typing
+            # construct, but valid Python syntax, and a field needs its
+            # length here because it is storage inside the struct.
+            self.eat("COMMA")
+            count_tok = self.cur()
+            if count_tok.kind != "NUMBER":
+                raise ParseError(
+                    f"line {line}: the length in `list[{inner.value}, n]` must be a "
+                    f"literal number, not {count_tok.value!r}"
+                )
+            self.pos += 1
+            count = int(count_tok.value)
+            if count < 1 or count > MAX_ARRAY_SIZE:
+                raise ParseError(
+                    f"line {line}: an array holds between 1 and {MAX_ARRAY_SIZE} "
+                    f"elements, not {count}"
+                )
+            self.eat("RBRACKET")
+            return arrays.make(inner.value, count)
         self.eat("RBRACKET")
         return arrays.make(inner.value)
 
@@ -326,6 +446,8 @@ class Parser:
                 return self.parse_aug_assign()
             if nxt == "LBRACKET" and self.__index_assignment_follows():
                 return self.parse_index_assign()
+            if nxt == "DOT" and self.__attribute_assignment_follows():
+                return self.parse_attribute_assign()
         return self.parse_expr_stmt()
 
     def __index_assignment_follows(self):
@@ -349,6 +471,55 @@ class Parser:
                 return False
             i += 1
         return False
+
+    def __attribute_assignment_follows(self):
+        """True if the `name.member` at the cursor is an assignment target."""
+        if self.nxt(2).kind != "NAME":
+            return False
+        after = self.nxt(3).kind
+        if after == "ASSIGN" or after in AUG_OPS:
+            return True
+        if after != "LBRACKET":
+            return False
+        i = self.pos + 3
+        depth = 0
+        while i < len(self.tokens):
+            kind = self.tokens[i].kind
+            if kind == "LBRACKET":
+                depth += 1
+            elif kind == "RBRACKET":
+                depth -= 1
+                if depth == 0:
+                    nxt = self.tokens[i + 1].kind if i + 1 < len(self.tokens) else "EOF"
+                    return nxt == "ASSIGN" or nxt in AUG_OPS
+            elif kind in ("NEWLINE", "EOF"):
+                return False
+            i += 1
+        return False
+
+    def parse_attribute_assign(self):
+        owner = self.eat("NAME")
+        self.eat("DOT")
+        member = self.eat("NAME").value
+
+        index = None
+        if self.at("LBRACKET"):
+            self.eat("LBRACKET")
+            index = self.parse_expression()
+            self.eat("RBRACKET")
+
+        op = None
+        if self.at("ASSIGN"):
+            self.eat("ASSIGN")
+        else:
+            op = AUG_OPS[self.take().kind]
+        value = self.parse_expression()
+        self.eat("NEWLINE")
+
+        if index is None:
+            return A.AttributeAssign(owner.value, member, value, owner.line, op)
+        return A.AttributeIndexAssign(owner.value, member, index, value,
+                                      owner.line, op)
 
     def parse_index_assign(self):
         name_tok = self.eat("NAME")
@@ -478,7 +649,7 @@ class Parser:
         line = self.cur().line
         expr = self.parse_expression()
         self.eat("NEWLINE")
-        if not isinstance(expr, (A.Call, A.Str)):
+        if not isinstance(expr, (A.Call, A.MethodCall, A.Str)):
             raise ParseError(
                 f"line {line}: this expression has no effect — only function calls are "
                 f"valid as statements"
@@ -670,15 +841,10 @@ class Parser:
         """
         owner = self.eat("NAME")
         if owner.value not in self.module_aliases:
-            self.eat("DOT")
-            member = self.cur().value if self.at("NAME") else "?"
-            raise ParseError(
-                f"line {owner.line}: '{owner.value}.{member}' is attribute access on a "
-                f"value, which is not part of this Python subset — there are no objects "
-                f"here to hold a field.\n"
-                f"  A dot is only valid on an imported module, e.g. "
-                f"`import math` then `math.sqrt(x)`."
-            )
+            # Not a module, so it is an attribute of a value. Whether that
+            # value is a class instance is not knowable here — the semantic
+            # phase decides, and produces the error when it is not.
+            return self.parse_attribute(owner)
         self.eat("DOT")
         member_tok = self.eat("NAME")
         canonical = f"{owner.value}.{member_tok.value}"
@@ -692,6 +858,28 @@ class Parser:
             return A.Name(canonical, member_tok.line)
         args = self.parse_arguments()
         return A.Call(canonical, args, member_tok.line)
+
+    def parse_attribute(self, owner):
+        """`obj.member`, `obj.member[i]` or `obj.method(args)`."""
+        self.eat("DOT")
+        member_tok = self.eat("NAME")
+        member = member_tok.value
+
+        if self.at("DOT"):
+            raise ParseError(
+                f"line {owner.line}: '{owner.value}.{member}.…' reaches through two "
+                f"objects. A field here is a number, a string or an array, never "
+                f"another object, so there is no second dot to follow."
+            )
+        if self.at("LPAREN"):
+            args = self.parse_arguments()
+            return A.MethodCall(owner.value, member, args, member_tok.line)
+        if self.at("LBRACKET"):
+            self.eat("LBRACKET")
+            index = self.parse_expression()
+            self.eat("RBRACKET")
+            return A.AttributeIndex(owner.value, member, index, member_tok.line)
+        return A.Attribute(owner.value, member, member_tok.line)
 
     def parse_arguments(self):
         """The `( ... )` of a call. Shared by plain and module calls."""
@@ -709,6 +897,9 @@ class Parser:
 
     def parse_call(self):
         name_tok = self.eat("NAME")
+        if name_tok.value in self.class_names:
+            args = self.parse_arguments()
+            return A.New(name_tok.value, args, name_tok.line)
         if name_tok.value == "print":
             raise ParseError(
                 f"line {name_tok.line}: print() returns None and may only be used as a "
