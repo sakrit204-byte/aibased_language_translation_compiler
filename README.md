@@ -321,6 +321,43 @@ True
 then a 30-move scramble, and the same scramble played backwards, which comes
 back to solved.
 
+## Asking what it would take
+
+The compiler stops at the first construct it cannot handle, which is right
+for a compiler and the wrong answer to "can this program be translated?".
+`--check` surveys the whole file instead:
+
+```
+$ python -m src.driver some_gui_app.py --check
+some_gui_app.py: 72 things outside the subset
+
+FIXABLE — the subset can express these, the code needs a change  (28)
+    def __init__(...)                  x3    first at line 24
+    parameter 'move'                   x2    first at line 47
+    code at module level               x1    first at line 233
+
+NOT YET — the compiler could support these  (9)
+    raise                              x3    first at line 10
+    tuple unpacking                    x3    first at line 95
+
+NEVER — these need an allocator, dispatch, or a runtime that is not here  (35)
+    tuple                              x12   first at line 87
+    tk.Label                           x3    first at line 138
+    lambda                             x2    first at line 175
+
+This program cannot be translated: 35 of the 72 are in the NEVER group.
+```
+
+The three verdicts are the point. **FIXABLE** is work on the program,
+**NOT YET** is work on the compiler, and **NEVER** means no amount of either
+will help — it needs a heap, dynamic dispatch, or a library the generated C
+has no binding to. Two tests keep the survey honest in both directions: it
+must not pass anything the compiler rejects, and must not flag anything the
+compiler accepts.
+
+The IDE shows the same survey under a failed translation, so the whole
+picture is on screen rather than one error per attempt.
+
 ## Imports
 
 An import here binds names. It does not execute a module, because there is no

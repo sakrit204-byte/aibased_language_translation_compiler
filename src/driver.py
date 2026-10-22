@@ -246,6 +246,9 @@ def main(argv=None):
     ap.add_argument("--run", action="store_true",
                     help="build the C with the detected compiler and run it")
     ap.add_argument("--emit-stdout", action="store_true", help="print the C instead of writing it")
+    ap.add_argument("--check", action="store_true",
+                    help="survey everything in the file this subset cannot "
+                         "translate, instead of stopping at the first one")
     args = ap.parse_args(argv)
 
     if args.ai and args.no_ai:
@@ -258,6 +261,11 @@ def main(argv=None):
     except OSError as e:
         print(f"error: cannot read {args.source}: {e}", file=sys.stderr)
         return 2
+
+    if args.check:
+        from .diagnose import report
+        print(report(source, args.source))
+        return 0
 
     try:
         c_code, stats, results = compile_source_detailed(

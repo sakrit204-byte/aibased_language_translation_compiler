@@ -1396,6 +1396,44 @@ class TranslationCompilerApp:
         if line:
             self._append_detail(f"\nHighlighted line {line} in the source.\n", "dim")
 
+        # The compiler stops at the first problem, which is right for a
+        # compiler and unhelpful when there are seventy. Survey the rest, so
+        # the whole picture is on screen instead of one error per attempt.
+        self._append_survey()
+
+    def _append_survey(self):
+        try:
+            from src.diagnose import NEVER, diagnose, summarise
+            findings = diagnose(self.source_pane.get_text())
+        except Exception:
+            return
+        if not findings:
+            return
+        verdicts = summarise(findings)
+        total = len(findings)
+        never = sum(verdicts[NEVER].values())
+
+        self._append_detail(
+            f"\n\nEverything else in the way ({total} in all)\n", "dim")
+        shown = 0
+        for f in findings:
+            if shown >= 25:
+                self._append_detail(f"    ... and {total - shown} more\n", "dim")
+                break
+            tone = "err" if f.verdict == NEVER else "dim"
+            self._append_detail(
+                f"    line {f.line:<5} {f.verdict:<8} {f.construct}\n", tone)
+            shown += 1
+        if never:
+            self._append_detail(
+                f"\n{never} of these cannot be translated at all — they need an "
+                f"allocator, dynamic dispatch, or a library the generated C has "
+                f"no binding to.\n", "err")
+        else:
+            self._append_detail(
+                "\nNone of these is impossible: each is a change to the code or "
+                "a feature to add.\n", "dim")
+
     # ------------------------------------------------------------------
     #  PIPELINE VIEW
     # ------------------------------------------------------------------
