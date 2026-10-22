@@ -219,7 +219,7 @@ Standard-library tkinter only; no third-party packages.
 
 ## What's out of scope
 
-Classes, lists/dicts/sets/tuples, comprehensions, slicing, decorators, lambdas,
+Classes, growable lists, dicts/sets/tuples, comprehensions, slicing, decorators, lambdas,
 generators, exceptions, closures, nested functions, chained assignment and
 comparison, default and keyword arguments, string concatenation and
 formatting. These are rejected by the grammar with a message that says so, not
@@ -238,6 +238,88 @@ hidden: Python integers are arbitrary precision while `py_int` is 64-bit and
 wraps, and recursion depth is the C stack's rather than
 `sys.getrecursionlimit()`. Everything else matches CPython exactly, and the
 tests prove it by diffing against CPython.
+
+## Arrays
+
+A fixed-size array is the one compound type in the subset:
+
+```python
+def bump(values: list[int]) -> None:
+    i: int = 0
+    while i < len(values):
+        values[i] = values[i] + 1
+        i = i + 1
+
+def main() -> int:
+    counts: list[int] = [0] * 8
+    primes: list[int] = [2, 3, 5, 7]
+    bump(counts)
+    print(counts[0], primes[-1], len(primes))
+    return 0
+```
+
+`counts: list[int] = [0] * 8` becomes `py_int counts[8]`. It lives on the
+stack, it is freed by returning, and it cannot leak — which is why a *fixed*
+array fits a compiler with no allocator where a growable list does not. The
+size has to be a literal because it becomes part of the C type. There is no
+append, no slicing and no resizing.
+
+Three places where C's defaults and Python's semantics disagree, and Python
+wins, because the whole claim of this compiler is that the two agree:
+
+- **A negative index counts from the end.** `a[-1]` is the last element, not
+  a read off the front of the array.
+- **An out-of-range index stops the program.** C would read whatever is at
+  that address and carry on. The generated code checks, prints the same
+  `IndexError` CPython does, and exits 1 — the same status.
+- **An array argument is shared, not copied.** Python passes the same list;
+  C passes the same storage. A function that writes through its parameter
+  changes the caller's array in both.
+
+C arrays decay to pointers when passed, which loses the size, so every array
+parameter compiles to *two* C parameters — the pointer and its length — and
+every call site passes both. That is what keeps `len()` and the bounds checks
+working inside a function:
+
+```c
+py_int total(py_int *values, py_int values__len)
+```
+
+Elements are never widened. `a: list[float] = [0] * 3` is an error rather
+than a silent conversion, because Python would keep the ints you wrote and C
+would store doubles, and the two would then print different numbers.
+
+**`demos/rubik.py` is what this was added for.** A Rubik's cube is 54
+stickers and a permutation table, and neither was expressible before: the
+table used to be a dict of lists of tuples, and is now one array of 72 ints.
+The program's own output asserts the properties a real cube has — four turns
+of a face is the identity, a move undoes its inverse, `(R U R' U')` has order
+six — and it is byte-identical to CPython:
+
+```
+$ python -m src.driver demos/rubik.py --run
+call sites: 38   AI-resolved: 0   model queries: 0   (AI-assist disabled)
+solved
+   WWW
+   WWW
+   WWW
+OOOGGGRRRBBB
+OOOGGGRRRBBB
+OOOGGGRRRBBB
+   YYY
+   YYY
+   YYY
+
+every face turned four times, still solved:
+True
+every move followed by its inverse, still solved:
+True
+(R U R' U') six times, back to solved:
+True
+```
+
+then a 30-move scramble, and the same scramble played backwards, which comes
+back to solved.
 
 ## Imports
 

@@ -127,7 +127,8 @@ def test_trailing_comma_in_a_call():
     ("def f() -> None:\n    x = print(1)\n", "only be used as a statement"),
     ("def f() -> None:\n    1 + 2\n", "no effect"),
     ("def f() -> None:\n    while 1:\n        pass\n    else:\n        pass\n", "while/else"),
-    ("def f() -> list:\n    pass\n", "not a type in this subset"),
+    ("def f() -> list:\n    pass\n", "needs an element type"),
+    ("def f() -> dict:\n    pass\n", "not a type in this subset"),
 ])
 def test_rejections_explain_themselves(source, message):
     with pytest.raises(ParseError, match=message):

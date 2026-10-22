@@ -34,6 +34,7 @@ can route it through the gate. See src/ai_assist/gate.py.
 
 from ..parser import ast_nodes as A
 from .symbol_table import SymbolTable, SemanticError
+from . import arrays
 from . import modules
 from .builtins import (
     BUILTINS, BuiltinError, assignable, check_call, is_numeric, join,
@@ -75,6 +76,17 @@ class TypeChecker:
 
     def check(self, program: A.Program):
         self._check_imports(program)
+
+        for fn in program.functions:
+            if arrays.is_array(fn.return_type):
+                raise SemanticError(
+                    f"line {fn.line}: '{fn.name}' is declared -> "
+                    f"{arrays.describe(fn.return_type)}, but a function cannot return "
+                    f"an array in this subset. C cannot return one either: the storage "
+                    f"is the function's own stack frame, which is gone by the time the "
+                    f"caller looks.\n  Pass the array in as a parameter and fill it "
+                    f"instead — it is shared, not copied."
+                )
 
         for fn in program.functions:
             if fn.name in RESERVED_NAMES:
@@ -181,6 +193,83 @@ class TypeChecker:
                 f"not -> {main['return_type']}"
             )
 
+    # ------------------------------------------------------------- arrays
+
+    def _size_annotation(self, stmt):
+        """Turn `list[int]` into `int[9]`, taking the size from the value.
+
+        The size has to be settled here because it becomes part of the C
+        type, and C needs it at the declaration.
+        """
+        declared = stmt.declared_type
+        want = arrays.element(declared)
+        value = stmt.value
+
+        if isinstance(value, A.ArrayRepeat):
+            count = value.count
+            got = self._literal_element_type(value.element, stmt.line)
+        elif isinstance(value, A.ArrayLit):
+            count = len(value.elements)
+            got = self._literal_element_type(value.elements[0], stmt.line)
+            for other in value.elements[1:]:
+                if self._literal_element_type(other, stmt.line) != got:
+                    raise SemanticError(
+                        f"line {stmt.line}: the elements of an array must all be the "
+                        f"same type; this one mixes {got} and "
+                        f"{self._literal_element_type(other, stmt.line)}"
+                    )
+        else:
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' is declared "
+                f"{arrays.describe(declared)}, so it must be initialised with an "
+                f"array — `[0] * n` or `[a, b, c]`. Its size becomes part of the "
+                f"C type, so it cannot come from anywhere else."
+            )
+
+        if got != want:
+            hint = ""
+            if want == "float" and got == "int":
+                hint = " — write the values as floats, e.g. `0.0`"
+            elif want == "int" and got == "float":
+                hint = " — write the values as ints, e.g. `0`"
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' is declared "
+                f"{arrays.describe(declared)} but is initialised with {got} values"
+                f"{hint}.\n  Array elements are not widened, because Python would "
+                f"keep what you wrote and C would not, and the two would then print "
+                f"different numbers."
+            )
+        return arrays.make(want, count)
+
+    def _literal_element_type(self, node, line):
+        """The type of one element of an array initialiser.
+
+        Only literals are allowed: the initialiser becomes a C initialiser
+        list, which has to be constant.
+        """
+        if isinstance(node, A.Num):
+            return "float" if node.is_float else "int"
+        if isinstance(node, A.Bool):
+            return "bool"
+        if isinstance(node, A.UnaryOp) and node.op in ("-", "+"):
+            return self._literal_element_type(node.operand, line)
+        raise SemanticError(
+            f"line {line}: an array initialiser takes literal numbers only, "
+            f"because it becomes a C initialiser list. Fill it with a loop "
+            f"after declaring it."
+        )
+
+    def _array_of(self, name, line):
+        """The array type of `name`, or an error explaining what it is."""
+        t = self.env.get(name) if self.env else None
+        if t is None:
+            t = self.symtab.lookup_var(name, line)
+        if not arrays.is_array(t):
+            raise SemanticError(
+                f"line {line}: '{name}' is {t}, not an array, so it cannot be indexed"
+            )
+        return t
+
     # ------------------------------------------------- pass 1: type inference
 
     def _collect_local_types(self, fn: A.FunctionDef):
@@ -190,6 +279,8 @@ class TypeChecker:
 
         for stmt in _walk_stmts(fn.body):
             if isinstance(stmt, A.Assign) and stmt.declared_type:
+                if arrays.is_array(stmt.declared_type):
+                    stmt.declared_type = self._size_annotation(stmt)
                 prev = annotated.get(stmt.name)
                 if prev and prev != stmt.declared_type:
                     raise SemanticError(
@@ -275,7 +366,32 @@ class TypeChecker:
 
     def _check_stmt(self, stmt, ret_type):
         if isinstance(stmt, A.Assign):
+            if isinstance(stmt.value, (A.ArrayLit, A.ArrayRepeat)):
+                # Checked by _size_annotation during the pre-pass; the type is
+                # already on the statement, and inferring the literal here
+                # would hit the "nowhere else one can go" rule above.
+                if not arrays.is_array(stmt.declared_type or ""):
+                    raise SemanticError(
+                        f"line {stmt.line}: '{stmt.name}' is given an array, so it must "
+                        f"be annotated, e.g. `{stmt.name}: list[int] = ...`"
+                    )
+                if stmt.name in self.defined:
+                    raise SemanticError(
+                        f"line {stmt.line}: '{stmt.name}' is already an array and cannot "
+                        f"be replaced with another one — assign to its elements instead. "
+                        f"A C array is storage, not a reference that can be repointed."
+                    )
+                stmt.value.inferred_type = stmt.declared_type
+                self.symtab.declare_var(stmt.name, stmt.declared_type, stmt.line)
+                self.defined.add(stmt.name)
+                return
             t = self._infer(stmt.value)
+            if arrays.is_array(t):
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' would be a second name for the "
+                    f"array '{getattr(stmt.value, 'id', '?')}'. This subset has no "
+                    f"references, so an array has exactly one name."
+                )
             if t == "None":
                 raise SemanticError(
                     f"line {stmt.line}: cannot assign None to '{stmt.name}' — this subset "
@@ -284,6 +400,31 @@ class TypeChecker:
             declared = self.symtab.declare_var(stmt.name, t, stmt.line)
             stmt.declared_type = declared
             self.defined.add(stmt.name)
+
+        elif isinstance(stmt, A.IndexAssign):
+            array_type = self._array_of(stmt.name, stmt.line)
+            element = arrays.element(array_type)
+            index_type = self._infer(stmt.index)
+            if index_type not in ("int", "bool"):
+                raise SemanticError(
+                    f"line {stmt.line}: an array index must be an int, not {index_type}"
+                )
+            value_type = self._infer(stmt.value)
+            if stmt.op:
+                value_type = self._binop_type(stmt.op, element, value_type,
+                                              stmt.value, stmt.line)
+            if value_type != element:
+                hint = ""
+                if element == "float" and value_type == "int":
+                    hint = " — write it as a float, e.g. `1.0`"
+                elif element == "int" and value_type == "float":
+                    hint = " — use int(...) if you mean to truncate"
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' holds {element}, so {value_type} "
+                    f"cannot be stored in it{hint}.\n  Elements are not widened: "
+                    f"Python would keep the value you wrote and C would convert it, "
+                    f"and the two would then print different numbers."
+                )
 
         elif isinstance(stmt, A.AugAssign):
             if stmt.name not in self.defined:
@@ -372,6 +513,14 @@ class TypeChecker:
 
         elif isinstance(stmt, A.Print):
             for arg in stmt.args:
+                if isinstance(arg, A.Name) and arrays.is_array(
+                        self.env.get(arg.id, "")):
+                    raise SemanticError(
+                        f"line {stmt.line}: print() cannot take a whole array. "
+                        f"Python would print `[1, 2, 3]` and matching that formatting "
+                        f"exactly is a separate job — loop and print the elements."
+                    )
+            for arg in stmt.args:
                 t = self._infer(arg)
                 if t == "None":
                     raise SemanticError(f"line {stmt.line}: cannot print None in this subset")
@@ -400,7 +549,7 @@ class TypeChecker:
         t = self._infer(expr)
         if t not in TRUTHY_TYPES:
             raise SemanticError(
-                f"line {getattr(expr, 'line', '?')}: a {t} value has no truth value in this "
+                f"line {getattr(expr, 'line', '?')}: a {arrays.describe(t)} value has no truth value in this "
                 f"subset"
             )
         return t
@@ -450,11 +599,19 @@ class TypeChecker:
                 st = self._infer(side)
                 if st not in TRUTHY_TYPES:
                     raise SemanticError(
-                        f"line {expr.line}: a {st} value has no truth value in this subset"
+                        f"line {expr.line}: a {arrays.describe(st)} value has no truth value in this subset"
                     )
             t = "bool"
         elif isinstance(expr, A.Call):
             t = self._infer_call(expr)
+        elif isinstance(expr, A.Index):
+            t = self._infer_index(expr)
+        elif isinstance(expr, (A.ArrayLit, A.ArrayRepeat)):
+            raise SemanticError(
+                f"line {expr.line}: an array literal may only initialise a variable "
+                f"declared `list[...]`. There is nowhere else one can go: this subset "
+                f"has no way to pass an array except by name."
+            )
         else:
             raise SemanticError(f"unhandled expression node: {type(expr).__name__}")
         expr.inferred_type = t
@@ -470,7 +627,7 @@ class TypeChecker:
             raise SemanticError(f"line {line}: operator '{op}' is not valid on str")
         if not (is_numeric(lt) and is_numeric(rt)):
             raise SemanticError(
-                f"line {line}: operator '{op}' is not valid on {lt} and {rt}"
+                f"line {line}: operator '{op}' is not valid on {arrays.describe(lt)} and {arrays.describe(rt)}"
             )
         if op == "/":
             return "float"                        # Python's / is always true division
@@ -483,11 +640,11 @@ class TypeChecker:
         if expr.op == "not":
             if t not in TRUTHY_TYPES:
                 raise SemanticError(
-                    f"line {expr.line}: a {t} value has no truth value in this subset"
+                    f"line {expr.line}: a {arrays.describe(t)} value has no truth value in this subset"
                 )
             return "bool"
         if not is_numeric(t):
-            raise SemanticError(f"line {expr.line}: unary '{expr.op}' is not valid on {t}")
+            raise SemanticError(f"line {expr.line}: unary '{expr.op}' is not valid on {arrays.describe(t)}")
         return "int" if t == "bool" else t        # -True is -1 in Python
 
     def _compare_type(self, expr):
@@ -518,7 +675,7 @@ class TypeChecker:
                 if not assignable(atype, ptype):
                     raise SemanticError(
                         f"line {call.line}: argument {i} of '{call.name}' ({pname}) is "
-                        f"{ptype}, got {atype}"
+                        f"{arrays.describe(ptype)}, got {arrays.describe(atype)}"
                     )
             call.kind = "user"
             return entry["return_type"]
@@ -554,6 +711,15 @@ class TypeChecker:
         # Unknown callees are assumed to produce a double. That is the widest
         # numeric type, so it can never silently truncate a real result.
         return "float"
+
+    def _infer_index(self, expr: A.Index):
+        array_type = self._array_of(expr.name, expr.line)
+        index_type = self._infer(expr.index)
+        if index_type not in ("int", "bool"):
+            raise SemanticError(
+                f"line {expr.line}: an array index must be an int, not {index_type}"
+            )
+        return arrays.element(array_type)
 
     # ------------------------------------------------------------- modules
 

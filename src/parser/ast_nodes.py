@@ -62,6 +62,16 @@ class Assign:
 
 
 @dataclass
+class IndexAssign:
+    """`a[i] = value`, and the augmented forms."""
+    name: str
+    index: object
+    value: object
+    line: int
+    op: str = None        # None for `=`, else "+", "-", "*", "/", "%"
+
+
+@dataclass
 class AugAssign:
     name: str
     op: str               # "+", "-", "*", "/", "//", "%", "**"
@@ -175,6 +185,32 @@ class Call:
     kind: str = None          # "user" | "builtin" | "module" | "ai"
     ai_expr: str = None       # the validated C expression, when kind == "ai"
     member: object = None     # modules.Member, when kind == "module"
+
+
+@dataclass
+class Index:
+    """`a[i]` as an expression."""
+    name: str
+    index: object
+    line: int
+    inferred_type: str = None
+
+
+@dataclass
+class ArrayLit:
+    """`[1, 2, 3]` — only valid as the initialiser of an array."""
+    elements: list
+    line: int
+    inferred_type: str = None
+
+
+@dataclass
+class ArrayRepeat:
+    """`[0] * 54` — the same, written as a repeat."""
+    element: object
+    count: int
+    line: int
+    inferred_type: str = None
 
 
 @dataclass

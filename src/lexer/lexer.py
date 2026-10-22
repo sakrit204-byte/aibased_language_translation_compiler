@@ -46,13 +46,12 @@ OPERATORS_1 = {
     "+": "PLUS", "-": "MINUS", "*": "STAR", "/": "SLASH", "%": "PERCENT",
     "(": "LPAREN", ")": "RPAREN", ":": "COLON", ",": "COMMA", "=": "ASSIGN",
     "<": "LT", ">": "GT", ".": "DOT",
+    "[": "LBRACKET", "]": "RBRACKET",
 }
 
 # Characters that are valid Python but outside this subset. Reporting them by
 # name is far more useful than "unexpected character '['".
 UNSUPPORTED = {
-    "[": "list/subscript syntax",
-    "]": "list/subscript syntax",
     "{": "dict/set syntax",
     "}": "dict/set syntax",
     "@": "decorators",
@@ -171,7 +170,8 @@ class Lexer:
             self.error(f"unexpected character {ch!r}")
 
         if self.paren_depth != 0:
-            self.error("unbalanced '(' — reached end of file inside a parenthesised expression")
+            self.error("unbalanced '(' or '[' — reached end of file inside a "
+                       "bracketed expression")
 
         # Close the final logical line, then unwind every open indent level.
         if self.line_has_tokens:
@@ -380,11 +380,11 @@ class Lexer:
         one = self.peek()
         if one in OPERATORS_1:
             self.advance()
-            if one == "(":
+            if one in ("(", "["):
                 self.paren_depth += 1
-            elif one == ")":
+            elif one in (")", "]"):
                 if self.paren_depth == 0:
-                    self.error("unmatched ')'", start_line)
+                    self.error("unmatched '%s'" % one, start_line)
                 self.paren_depth -= 1
             self.emit(OPERATORS_1[one], one, start_line, start_col)
             return True

@@ -39,12 +39,30 @@ function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" block ;
 
 param_list     = param { "," param } ;
 param          = IDENT ":" type ;
-type           = "int" | "float" | "str" | "bool" | "None" ;
+type           = "int" | "float" | "str" | "bool" | "None" | array_type ;
+
+(* ------------------------------------------------------------------ *)
+(* Fixed-size arrays are the one compound type here. The size is part  *)
+(* of the C type, so it must be a literal and it never changes: there  *)
+(* is no append, no slicing and no resizing. That is what lets an      *)
+(* array be `py_int a[54]` on the stack, with no allocator behind it.  *)
+(*                                                                     *)
+(* A parameter's size is not known in the callee, because C arrays     *)
+(* decay to pointers — so every array parameter is compiled to two,    *)
+(* the pointer and its length, and len() reads the second.             *)
+(* ------------------------------------------------------------------ *)
+
+array_type     = "list" "[" ( "int" | "float" | "bool" ) "]" ;
+
+array_init     = "[" expression { "," expression } [ "," ] "]"
+               | "[" expression "]" "*" NUMBER ;
+                 (* elements must be literals: it becomes a C initialiser *)
 
 block          = NEWLINE INDENT [ STRING NEWLINE ] { statement } DEDENT ;
                  (* a leading string literal is a docstring, not a statement *)
 
 statement      = assign_stmt
+               | index_assign_stmt
                | aug_assign_stmt
                | if_stmt
                | while_stmt
@@ -95,9 +113,18 @@ power          = atom [ "**" unary ] ;
                  (* right-associative, and binds tighter than a unary minus on
                     its left: -2 ** 2 is -4, and 2 ** -1 parses *)
 
+index_assign_stmt = IDENT "[" expression "]" [ "+" | "-" | "*" | "/" | "%" ]
+                    "=" expression NEWLINE ;
+
 atom           = NUMBER | FLOAT | STRING
                | "True" | "False" | "None"
-               | call_expr | module_const | IDENT | "(" expression ")" ;
+               | call_expr | module_const | index_expr
+               | IDENT | "(" expression ")" ;
+
+index_expr     = IDENT "[" expression "]" ;
+                 (* a negative index counts from the end, as Python's does, *)
+                 (* and an out-of-range one stops the program rather than   *)
+                 (* reading whatever C would find at that address.          *)
 
 call_expr      = [ IDENT "." ] IDENT "(" [ arg_list ] ")" ;
                  (* the qualified form is only valid on an imported module *)

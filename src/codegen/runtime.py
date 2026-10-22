@@ -220,6 +220,30 @@ static py_int py_abs_int(py_int v)
 """)
 
 
+_helper("py_index", ["py_fatal"])("""
+/* Array subscripting with Python's rules rather than C's.
+ *
+ * C reads whatever is at the address and carries on; Python raises
+ * IndexError, and counts a negative index from the end. Both of those matter
+ * for this compiler's claim that the C agrees with CPython, so the check is
+ * not optional and is not a debug build only. A program that would raise in
+ * Python stops here with the same message and the same exit status. */
+static py_int py_index(py_int i, py_int length)
+{
+    py_int original = i;
+    if (i < 0) i += length;
+    if (i < 0 || i >= length) {
+        char message[128];
+        snprintf(message, sizeof message,
+                 "IndexError: list index out of range (index %lld, length %lld)",
+                 (long long)original, (long long)length);
+        py_fatal(message);
+    }
+    return i;
+}
+""")
+
+
 _helper("py_min_int")("""
 static py_int py_min_int(py_int a, py_int b) { return a < b ? a : b; }
 """)

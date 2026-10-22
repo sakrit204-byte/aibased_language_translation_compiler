@@ -109,10 +109,15 @@ def test_blank_and_comment_lines_do_not_affect_indentation():
 
 
 def test_unsupported_syntax_is_named():
-    with pytest.raises(LexError, match="list/subscript"):
-        Lexer("x = [1]\n").tokenize()
     with pytest.raises(LexError, match="dict/set"):
         Lexer("x = {1}\n").tokenize()
+
+
+def test_brackets_lex_now_that_arrays_exist():
+    """`[` and `]` reach the parser, which has the context to tell an array
+    literal from an index. See tests/test_arrays.py for what it does."""
+    kinds = [t.kind for t in Lexer("x = [1]\n").tokenize()]
+    assert "LBRACKET" in kinds and "RBRACKET" in kinds
 
 
 def test_bang_suggests_not():

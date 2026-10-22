@@ -23,3 +23,9 @@ env/
 *.key
 secrets/
 openrouter_key.txt
+
+# C produced by the compiler from a demo or test program. src/runtime/*.c is
+# hand-written and stays tracked; these are build output.
+demos/*.c
+tests/programs/*.c
+tests/programs/**/*.c

@@ -11,7 +11,17 @@ Two details that are easy to get wrong and are handled explicitly here:
 """
 
 from . import ast_nodes as A
+from ..semantic import arrays
 from ..lexer.tokens import TYPE_NAMES
+
+
+# Element types an array may hold. Strings are excluded: a str in this subset
+# is a pointer to a literal, so an array of them would be an array of
+# pointers, and nothing can be written into one without an allocator.
+ARRAY_ELEMENT_TYPES = ("int", "float", "bool")
+
+# An array is a C stack object, so the ceiling is the stack, not memory.
+MAX_ARRAY_SIZE = 4096
 
 
 class ParseError(Exception):
@@ -217,13 +227,40 @@ class Parser:
         if t.kind == "KEYWORD" and t.value == "None":
             self.pos += 1
             return "None"
+        if t.kind == "NAME" and t.value == "list":
+            return self.parse_array_type()
         if t.kind == "NAME" and t.value in TYPE_NAMES:
             self.pos += 1
             return t.value
         raise ParseError(
             f"line {t.line}: {t.value!r} is not a type in this subset "
-            f"(expected one of int, float, str, bool, None)"
+            f"(expected int, float, str, bool, None, or list[...])"
         )
+
+    def parse_array_type(self):
+        """`list[int]` — a fixed-size array. The size comes from the
+        initialiser, or from the caller when it is a parameter."""
+        line = self.eat("NAME").value and self.tokens[self.pos - 1].line
+        if not self.at("LBRACKET"):
+            raise ParseError(
+                f"line {line}: `list` needs an element type in this subset, "
+                f"e.g. `list[int]`. A bare list has no C representation."
+            )
+        self.eat("LBRACKET")
+        inner = self.cur()
+        if inner.kind == "NAME" and inner.value == "list":
+            raise ParseError(
+                f"line {line}: `list[list[...]]` is not part of this subset — "
+                f"arrays hold numbers, not other arrays"
+            )
+        if inner.kind != "NAME" or inner.value not in ARRAY_ELEMENT_TYPES:
+            raise ParseError(
+                f"line {line}: {inner.value!r} is not an array element type "
+                f"(expected one of {', '.join(sorted(ARRAY_ELEMENT_TYPES))})"
+            )
+        self.pos += 1
+        self.eat("RBRACKET")
+        return arrays.make(inner.value)
 
     def parse_block(self, allow_docstring=False):
         self.eat("NEWLINE")
@@ -287,7 +324,45 @@ class Parser:
                 return self.parse_assign()
             if nxt in AUG_OPS:
                 return self.parse_aug_assign()
+            if nxt == "LBRACKET" and self.__index_assignment_follows():
+                return self.parse_index_assign()
         return self.parse_expr_stmt()
+
+    def __index_assignment_follows(self):
+        """True if the `name[` at the cursor is an assignment target.
+
+        Needed because `a[i] = 1` and `print(a[i])` both start the same way,
+        and the brackets can nest (`a[b[i]] = 1`), so this counts them.
+        """
+        i = self.pos + 1
+        depth = 0
+        while i < len(self.tokens):
+            kind = self.tokens[i].kind
+            if kind == "LBRACKET":
+                depth += 1
+            elif kind == "RBRACKET":
+                depth -= 1
+                if depth == 0:
+                    nxt = self.tokens[i + 1].kind if i + 1 < len(self.tokens) else "EOF"
+                    return nxt == "ASSIGN" or nxt in AUG_OPS
+            elif kind in ("NEWLINE", "EOF"):
+                return False
+            i += 1
+        return False
+
+    def parse_index_assign(self):
+        name_tok = self.eat("NAME")
+        self.eat("LBRACKET")
+        index = self.parse_expression()
+        self.eat("RBRACKET")
+        op = None
+        if self.at("ASSIGN"):
+            self.eat("ASSIGN")
+        else:
+            op = AUG_OPS[self.take().kind]
+        value = self.parse_expression()
+        self.eat("NEWLINE")
+        return A.IndexAssign(name_tok.value, index, value, name_tok.line, op)
 
     def parse_assign(self):
         name_tok = self.eat("NAME")
@@ -507,8 +582,21 @@ class Parser:
                 return self.parse_module_access()
             if self.nxt().kind == "LPAREN":
                 return self.parse_call()
+            if self.nxt().kind == "LBRACKET":
+                self.pos += 1
+                self.eat("LBRACKET")
+                index = self.parse_expression()
+                self.eat("RBRACKET")
+                if self.at("LBRACKET"):
+                    raise ParseError(
+                        f"line {t.line}: '{t.value}[...][...]' indexes twice; arrays in "
+                        f"this subset hold numbers, not other arrays"
+                    )
+                return A.Index(t.value, index, t.line)
             self.pos += 1
             return A.Name(t.value, t.line)
+        if t.kind == "LBRACKET":
+            return self.parse_array_literal()
         if t.kind == "LPAREN":
             self.eat("LPAREN")
             expr = self.parse_expression()
@@ -517,6 +605,61 @@ class Parser:
             self.eat("RPAREN")
             return expr
         raise ParseError(f"line {t.line}: unexpected token {t.kind} {t.value!r}")
+
+    def parse_array_literal(self):
+        """`[1, 2, 3]` or `[0] * 54`.
+
+        Only valid as an initialiser, which the semantic phase enforces —
+        there is nowhere else a value of array type could go, because the
+        subset has no way to pass one except by name.
+        """
+        line = self.eat("LBRACKET").line
+        elements = []
+        if not self.at("RBRACKET"):
+            elements.append(self.parse_expression())
+            while self.at("COMMA"):
+                self.eat("COMMA")
+                if self.at("RBRACKET"):          # trailing comma
+                    break
+                elements.append(self.parse_expression())
+        self.eat("RBRACKET")
+
+        if self.at("STAR"):
+            self.eat("STAR")
+            if len(elements) != 1:
+                raise ParseError(
+                    f"line {line}: `[...] * n` repeats a single value, so the "
+                    f"brackets must hold exactly one, not {len(elements)}"
+                )
+            count_tok = self.cur()
+            if count_tok.kind != "NUMBER":
+                raise ParseError(
+                    f"line {line}: the length of an array must be a literal number, "
+                    f"not {count_tok.value!r} — it becomes part of the C type, so it "
+                    f"has to be known while compiling"
+                )
+            self.pos += 1
+            count = int(count_tok.value)
+            if count < 1:
+                raise ParseError(f"line {line}: an array needs at least one element")
+            if count > MAX_ARRAY_SIZE:
+                raise ParseError(
+                    f"line {line}: {count} elements is beyond this subset's limit of "
+                    f"{MAX_ARRAY_SIZE}; the array lives on the C stack"
+                )
+            return A.ArrayRepeat(elements[0], count, line)
+
+        if not elements:
+            raise ParseError(
+                f"line {line}: an empty array has no element type and no size; "
+                f"write `[0] * n` instead"
+            )
+        if len(elements) > MAX_ARRAY_SIZE:
+            raise ParseError(
+                f"line {line}: {len(elements)} elements is beyond this subset's limit "
+                f"of {MAX_ARRAY_SIZE}"
+            )
+        return A.ArrayLit(elements, line)
 
     def parse_module_access(self):
         """`math.sqrt(x)` or `math.pi`.

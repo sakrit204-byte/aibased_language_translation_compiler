@@ -11,6 +11,7 @@ meaning its callee is neither user-defined nor a known builtin.
 import re
 
 from ..parser import ast_nodes as A
+from ..semantic import arrays
 
 C_TYPE = {
     "int": "py_int",
@@ -49,10 +50,18 @@ class CodegenError(Exception):
 
 
 def type_to_c(t):
+    if arrays.is_array(t):
+        return C_TYPE[arrays.element(t)] + " *"
     try:
         return C_TYPE[t]
     except KeyError:
         raise CodegenError(f"no C type for {t!r}") from None
+
+
+def array_declaration(t, name):
+    """`py_int a[54]` — the declaration form, where the size is part of the
+    type rather than a pointer."""
+    return "%s %s[%d]" % (C_TYPE[arrays.element(t)], name, arrays.size(t))
 
 
 def c_name(name: str) -> str:
@@ -119,6 +128,12 @@ class CodegenRules:
     def __init__(self, request, ai_resolver=None, func_name=c_name):
         self.request = request
         self.ai_resolver = ai_resolver
+        # The local type environment of the function being emitted. Set by
+        # the emitter before each one, because an array's length depends on
+        # which function it is declared in.
+        self.local_types = {}
+        # name -> the symbol table's entry, for the parameter types.
+        self.functions = {}
         # Maps a Python function name to the C symbol the emitter gave it.
         # `main` needs special handling: C's entry point has a fixed signature.
         self.func_name = func_name
@@ -136,6 +151,8 @@ class CodegenRules:
             if node.member is not None:          # a module constant: math.pi
                 return node.member.render([])
             return c_name(node.id)
+        if isinstance(node, A.Index):
+            return f"{c_name(node.name)}[{self.index_expr(node)}]"
         if isinstance(node, A.BinOp):
             return self.binop(node)
         if isinstance(node, A.UnaryOp):
@@ -160,6 +177,14 @@ class CodegenRules:
                 f"did not visit it"
             )
         return t
+
+    def type_of_name(self, name):
+        try:
+            return self.local_types[name]
+        except KeyError:
+            raise CodegenError(
+                f"internal error: '{name}' has no recorded type in this function"
+            ) from None
 
     # ---------------------------------------------------------- truthiness
 
@@ -225,6 +250,32 @@ class CodegenRules:
             return f"(strcmp({left}, {right}) {node.op} 0)"
         return f"({left} {node.op} {right})"
 
+    # -------------------------------------------------------------- arrays
+
+    def index_expr(self, node):
+        """The C index expression for `a[i]`, bounds-checked.
+
+        Python raises IndexError for an out-of-range index and counts a
+        negative one from the end. C does neither — it reads whatever is at
+        that address. py_index() restores both behaviours, so a program that
+        would raise in Python stops in C instead of quietly reading rubbish.
+        """
+        self.request("py_index")
+        return f"py_index({self.expr(node.index)}, {self.array_length(node.name)})"
+
+    def array_length(self, name):
+        """The length of an array, as a C expression.
+
+        A local knows its own size at compile time. A parameter does not —
+        C arrays decay to pointers — so it carries its length alongside; see
+        semantic/arrays.py.
+        """
+        t = self.type_of_name(name)
+        n = arrays.size(t)
+        if n is not None:
+            return str(n)
+        return c_name(arrays.length_name(name))
+
     # --------------------------------------------------------------- calls
 
     def call(self, node: A.Call) -> str:
@@ -232,7 +283,7 @@ class CodegenRules:
         types = [self.type_of(a) for a in node.args]
 
         if node.kind == "user":
-            return f"{self.func_name(node.name)}({', '.join(args)})"
+            return f"{self.func_name(node.name)}({', '.join(self.user_args(node, args))})"
         if node.kind == "builtin":
             return self.builtin(node, args, types)
         if node.kind == "module":
@@ -245,6 +296,26 @@ class CodegenRules:
         raise CodegenError(
             f"line {node.line}: call to '{node.name}' was never classified by semantic analysis"
         )
+
+    def user_args(self, node: A.Call, args):
+        """Arguments for a call to a user function.
+
+        Each array argument is followed by its length, matching the two C
+        parameters the callee was given.
+        """
+        entry = self.functions.get(node.name)
+        if entry is None:
+            return args
+        out = []
+        for (_, param_type), arg_node, rendered in zip(entry["params"], node.args, args):
+            out.append(rendered)
+            if arrays.is_array(param_type):
+                if not isinstance(arg_node, A.Name):
+                    raise CodegenError(
+                        f"line {node.line}: an array argument must be a plain name"
+                    )
+                out.append(self.array_length(arg_node.id))
+        return out
 
     def ai_call(self, node: A.Call, args) -> str:
         if node.ai_expr is None:
@@ -261,6 +332,10 @@ class CodegenRules:
         result = self.type_of(node)
 
         if name == "len":
+            target = node.args[0]
+            if isinstance(target, A.Name) and arrays.is_array(
+                    self.local_types.get(target.id, "")):
+                return self.array_length(target.id)
             return f"(py_int)strlen({args[0]})"
 
         if name == "put":

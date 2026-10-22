@@ -18,10 +18,40 @@ nodes the semantic phase tagged `kind == "ai"`.
 """
 
 from ..parser import ast_nodes as A
-from .rules import ZERO_VALUE, CodegenError, CodegenRules, c_name, type_to_c
+from ..semantic import arrays
+from ..semantic import arrays
+from .rules import (ZERO_VALUE, CodegenError, CodegenRules, array_declaration,
+                    c_name, type_to_c)
 from .runtime import prelude_for
 
 INDENT = "    "
+
+
+def _param_decls(params):
+    """C parameters for a Python parameter list.
+
+    An array becomes two: the pointer C decays it to, and its length, which
+    the pointer loses. Every call site passes both. See semantic/arrays.py.
+    """
+    out = []
+    for p in params:
+        if arrays.is_array(p.type):
+            out.append(f"{type_to_c(p.type)}{c_name(p.name)}")
+            out.append(f"py_int {c_name(arrays.length_name(p.name))}")
+        else:
+            out.append(f"{type_to_c(p.type)} {c_name(p.name)}")
+    return out
+
+
+def _walk_assignments(block):
+    """Every Assign in a block, including nested ones."""
+    for stmt in block:
+        yield stmt
+        if isinstance(stmt, A.If):
+            for _, body in stmt.branches:
+                yield from _walk_assignments(body)
+        elif isinstance(stmt, (A.While, A.For)):
+            yield from _walk_assignments(stmt.body)
 
 # The user's `main` cannot be C's `main`: the entry point has a fixed
 # signature (`int main(void)`) while the Python one may return None or a
@@ -37,6 +67,9 @@ class Emitter:
         self.ai_call_sites = 0
         self._tmp = 0
         self.rules = CodegenRules(self.needs.add, self._count_ai(ai_resolver), self._func_name)
+        # Call sites need the callee's parameter types, to know which
+        # arguments are arrays and must be followed by their length.
+        self.rules.functions = symtab.functions
 
     def _count_ai(self, ai_resolver):
         if ai_resolver is None:
@@ -59,7 +92,7 @@ class Emitter:
 
     def _signature(self, fn: A.FunctionDef):
         if fn.params:
-            params = ", ".join(f"{type_to_c(p.type)} {c_name(p.name)}" for p in fn.params)
+            params = ", ".join(_param_decls(fn.params))
         else:
             params = "void"
         return f"{type_to_c(fn.return_type)} {self._func_name(fn.name)}({params})"
@@ -132,10 +165,16 @@ class Emitter:
         lines.append(self._signature(fn))
         lines.append("{")
 
+        self.rules.local_types = local_types
+
         declared = self._declaration_order(fn, local_types, param_names)
         for name in declared:
             t = local_types[name]
-            lines.append(f"{INDENT}{type_to_c(t)} {c_name(name)} = {ZERO_VALUE[t]};")
+            if arrays.is_array(t):
+                lines.append(f"{INDENT}{array_declaration(t, c_name(name))} = "
+                             f"{self._array_initialiser(fn, name, t)};")
+            else:
+                lines.append(f"{INDENT}{type_to_c(t)} {c_name(name)} = {ZERO_VALUE[t]};")
         if declared:
             lines.append("")
 
@@ -143,6 +182,32 @@ class Emitter:
         lines.extend(body)
         lines.append("}")
         return "\n".join(lines)
+
+    def _array_initialiser(self, fn, name, t):
+        """The `= {...}` for an array declaration.
+
+        C initialises the rest of an array to zero when the list is short,
+        so `[0] * 54` needs only `{0}` however long it is. Anything else is
+        written out in full, which is why the elements have to be literals.
+        """
+        node = None
+        for stmt in _walk_assignments(fn.body):
+            if isinstance(stmt, A.Assign) and stmt.name == name:
+                node = stmt.value
+                break
+        if node is None:
+            return "{0}"
+
+        if isinstance(node, A.ArrayRepeat):
+            value = self.rules.expr(node.element)
+            if value in ("0", "0.0"):
+                return "{0}"
+            return "{" + ", ".join([value] * node.count) + "}"
+
+        if isinstance(node, A.ArrayLit):
+            return "{" + ", ".join(self.rules.expr(e) for e in node.elements) + "}"
+
+        return "{0}"
 
     @staticmethod
     def _declaration_order(fn, local_types, param_names):
@@ -173,7 +238,16 @@ class Emitter:
         pad = INDENT * indent
 
         if isinstance(node, A.Assign):
+            if isinstance(node.value, (A.ArrayLit, A.ArrayRepeat)):
+                # The declaration above already carries the initialiser list;
+                # C has no way to assign a whole array afterwards.
+                return []
             return [f"{pad}{c_name(node.name)} = {self.rules.expr(node.value)};"]
+
+        if isinstance(node, A.IndexAssign):
+            target = f"{c_name(node.name)}[{self.rules.index_expr(node)}]"
+            op = f"{node.op}=" if node.op else "="
+            return [f"{pad}{target} {op} {self.rules.expr(node.value)};"]
 
         if isinstance(node, A.AugAssign):
             if node.expanded is None:

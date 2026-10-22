@@ -10,6 +10,8 @@ Adding a builtin means adding a type rule here *and* a C template in
 codegen/rules.py. `tests/test_builtin_coverage.py` asserts the two stay in sync.
 """
 
+from . import arrays
+
 NUMERIC = ("bool", "int", "float")
 _RANK = {"bool": 0, "int": 1, "float": 2}
 
@@ -37,6 +39,11 @@ def assignable(source, target):
 
     Widening only, exactly as Python's numeric tower allows: bool -> int -> float.
     """
+    if arrays.is_array(source) or arrays.is_array(target):
+        # No widening between arrays: an array of int and an array of double
+        # have different layouts, so C would reinterpret the bytes rather
+        # than convert them.
+        return arrays.compatible(source, target)
     if source == target:
         return True
     if source in _RANK and target in _RANK:
@@ -69,14 +76,19 @@ def _require_numeric(name, arg_types, line):
 # Each returns the result type, or raises BuiltinError.
 
 def _len(arg_types, args, line):
+    """len() of a str, or of an array.
+
+    For an array this is a compile-time constant when the size is known, and
+    the hidden length parameter when it is not — see semantic/arrays.py.
+    """
     if len(arg_types) != 1:
-        raise BuiltinError(f"line {line}: len() takes exactly one argument, got {len(arg_types)}")
-    if arg_types[0] != "str":
-        raise BuiltinError(
-            f"line {line}: len() needs a str in this subset, got {arg_types[0]} "
-            f"(there are no sequence types)"
-        )
-    return "int"
+        raise BuiltinError(f"line {line}: len() takes 1 argument, got {len(arg_types)}")
+    t = arg_types[0]
+    if t == "str" or arrays.is_array(t):
+        return "int"
+    raise BuiltinError(
+        f"line {line}: len() needs a str or an array, got {t}"
+    )
 
 
 def _put(arg_types, args, line):
