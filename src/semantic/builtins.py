@@ -11,6 +11,7 @@ codegen/rules.py. `tests/test_builtin_coverage.py` asserts the two stay in sync.
 """
 
 from . import arrays
+from . import dicts
 
 NUMERIC = ("bool", "int", "float")
 _RANK = {"bool": 0, "int": 1, "float": 2}
@@ -84,10 +85,10 @@ def _len(arg_types, args, line):
     if len(arg_types) != 1:
         raise BuiltinError(f"line {line}: len() takes 1 argument, got {len(arg_types)}")
     t = arg_types[0]
-    if t == "str" or arrays.is_array(t):
+    if t == "str" or arrays.is_array(t) or dicts.is_dict(t):
         return "int"
     raise BuiltinError(
-        f"line {line}: len() needs a str or an array, got {t}"
+        f"line {line}: len() needs a str, an array or a dict, got {t}"
     )
 
 

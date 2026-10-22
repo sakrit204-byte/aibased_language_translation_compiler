@@ -102,7 +102,8 @@ def compile_source_detailed(source, use_ai=False, model=None, log_path=None,
         resolver = gate.resolve
 
     emitter = Emitter(symtab, ai_resolver=resolver, profiles=checker.profiles,
-                      class_info=checker.classes)
+                      class_info=checker.classes,
+                      global_dicts=checker.global_dicts)
     try:
         c_code = emitter.emit_program(ast)
     except (CodegenError, AIAssistError) as e:

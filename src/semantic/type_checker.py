@@ -36,6 +36,7 @@ from ..parser import ast_nodes as A
 from .symbol_table import SymbolTable, SemanticError
 from . import arrays
 from . import classes
+from . import dicts
 from . import modules
 from .builtins import (
     BUILTINS, BuiltinError, assignable, check_call, is_numeric, join,
@@ -66,6 +67,9 @@ class TypeChecker:
         self.imported = {}              # local name -> (Module, Member)
         self.profiles = []              # profiles.Profile, in import order
         self.classes = {}               # name -> classes.ClassInfo
+        # Class-level dicts, which are shared and never written, so they
+        # become file-scope arrays: C symbol -> (type, literal).
+        self.global_dicts = {}
         self.current_class = None       # set while checking a method body
         self.ai_calls = []          # Call nodes tagged kind="ai", in source order
         self.call_sites = 0         # every call site, for an honest AI-usage rate
@@ -386,6 +390,15 @@ class TypeChecker:
                         f"      def __init__(self) -> None:\n"
                         f"          self.{const_name} = [0] * N"
                     )
+                if isinstance(value, A.DictLit):
+                    const_type = self._dict_constant_type(
+                        node.name, const_name, const_type, value, line)
+                    info.constants[const_name] = classes.Constant(
+                        const_name, const_type, value, line)
+                    self.global_dicts[
+                        classes.method_symbol(node.name, const_name)] = (
+                            const_type, value)
+                    continue
                 if not isinstance(value, (A.Num, A.Str, A.Bool,
                                           A.UnaryOp)):
                     raise SemanticError(
@@ -556,6 +569,139 @@ class TypeChecker:
             )
         return arrays.make(want, count)
 
+    def _dict_constant_type(self, class_name, const_name, declared, node, line):
+        """Check a class-level dict literal and give it its sized type.
+
+        A dict in a class body is one object shared by every instance — which
+        is exactly right when nothing writes to it, and that is enforced:
+        assigning to a class constant is already an error.
+        """
+        if not dicts.is_dict(declared):
+            raise SemanticError(
+                f"line {line}: '{class_name}.{const_name}' is given a dict, so it "
+                f"must be annotated, e.g. `{const_name}: dict[str, str] = {{...}}`"
+            )
+        want_key = dicts.key_type(declared)
+        want_value = dicts.value_type(declared)
+        seen = []
+        for key in node.keys:
+            got = self._literal_key_type(key, line)
+            if got != want_key:
+                raise SemanticError(
+                    f"line {line}: '{class_name}.{const_name}' has {want_key} keys "
+                    f"but one is {got}"
+                )
+            text = self._literal_key_text(key)
+            if text in seen:
+                raise SemanticError(
+                    f"line {line}: duplicate key {text!r} in "
+                    f"'{class_name}.{const_name}'"
+                )
+            seen.append(text)
+        for value in node.values:
+            got = self._literal_value_type(value, line)
+            if got != want_value:
+                raise SemanticError(
+                    f"line {line}: '{class_name}.{const_name}' holds {want_value} "
+                    f"values but one is {got}"
+                )
+        return dicts.make(want_key, want_value, len(node.keys))
+
+    def _size_dict_annotation(self, stmt):
+        """Turn `dict[str, int]` into a type carrying the key count, and
+        check the literal against it."""
+        declared = stmt.declared_type
+        want_key = dicts.key_type(declared)
+        want_value = dicts.value_type(declared)
+        node = stmt.value
+
+        if not isinstance(node, A.DictLit):
+            raise SemanticError(
+                f"line {stmt.line}: '{stmt.name}' is declared "
+                f"{dicts.describe(declared)}, so it must be initialised with a "
+                f"dict literal. Its keys become part of the type, so they have to "
+                f"be written out here."
+            )
+
+        seen = []
+        for key in node.keys:
+            got = self._literal_key_type(key, stmt.line)
+            if got != want_key:
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' has {want_key} keys but "
+                    f"'{self._literal_key_text(key)}' is {got}"
+                )
+            text = self._literal_key_text(key)
+            if text in seen:
+                raise SemanticError(
+                    f"line {stmt.line}: duplicate key {text!r} in '{stmt.name}'. "
+                    f"Python would keep the last one silently; here the key set is "
+                    f"the type, so it has to be written once."
+                )
+            seen.append(text)
+
+        for value in node.values:
+            got = self._literal_value_type(value, stmt.line)
+            if got != want_value:
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' holds {want_value} values but "
+                    f"one entry is {got}"
+                )
+        return dicts.make(want_key, want_value, len(node.keys))
+
+    def _literal_value_type(self, node, line):
+        """A dict value may be a string as well as a number — unlike an
+        array element, which has to be numeric."""
+        if isinstance(node, A.Str):
+            return "str"
+        return self._literal_element_type(node, line)
+
+    def _literal_key_type(self, node, line):
+        if isinstance(node, A.Str):
+            return "str"
+        if isinstance(node, A.Num) and not node.is_float:
+            return "int"
+        raise SemanticError(
+            f"line {line}: a dict key must be a literal string or int — the keys "
+            f"are part of the type, so they are fixed while compiling"
+        )
+
+    @staticmethod
+    def _literal_key_text(node):
+        return node.value if isinstance(node, A.Str) else str(node.value)
+
+    def _dict_of(self, name, line):
+        """The dict type of `name`, which may be `d` or `obj.CONST`."""
+        if "." in name:
+            owner, _, member = name.partition(".")
+            info = None
+            if owner in self.classes and not (self.env or {}).get(owner):
+                info = self.classes[owner]
+            else:
+                t = (self.env or {}).get(owner)
+                if classes.is_instance(t or ""):
+                    info = self.classes[classes.class_of(t)]
+            if info is None:
+                return None
+            kind, thing = info.lookup(member)
+            if kind != "constant" or not dicts.is_dict(thing.type):
+                return None
+            return thing.type
+        t = (self.env or {}).get(name)
+        if t is None and self.symtab.has_var(name):
+            t = self.symtab.lookup_var(name, line)
+        return t if dicts.is_dict(t) else None
+
+    def _dict_symbol(self, name):
+        """The C symbol a dotted dict name refers to."""
+        if "." not in name:
+            return name
+        owner, _, member = name.partition(".")
+        if owner in self.classes and not (self.env or {}).get(owner):
+            return classes.method_symbol(owner, member)
+        t = (self.env or {}).get(owner)
+        return classes.method_symbol(classes.class_of(t), member)
+
     def _literal_element_type(self, node, line):
         """The type of one element of an array initialiser.
 
@@ -596,6 +742,8 @@ class TypeChecker:
             if isinstance(stmt, A.Assign) and stmt.declared_type:
                 if arrays.is_array(stmt.declared_type):
                     stmt.declared_type = self._size_annotation(stmt)
+                elif dicts.is_dict(stmt.declared_type):
+                    stmt.declared_type = self._size_dict_annotation(stmt)
                 prev = annotated.get(stmt.name)
                 if prev and prev != stmt.declared_type:
                     raise SemanticError(
@@ -608,6 +756,10 @@ class TypeChecker:
                         f"{env[stmt.name]} and cannot be re-annotated as {stmt.declared_type}"
                     )
                 annotated[stmt.name] = stmt.declared_type
+            elif isinstance(stmt, A.ForKeys):
+                t = self._dict_of(stmt.dict_name, stmt.line)
+                if dicts.is_dict(t):
+                    env[stmt.var] = dicts.key_type(t)
             elif isinstance(stmt, A.For):
                 env.setdefault(stmt.var, "int")
                 if annotated.get(stmt.var, "int") != "int":
@@ -681,6 +833,23 @@ class TypeChecker:
 
     def _check_stmt(self, stmt, ret_type):
         if isinstance(stmt, A.Assign):
+            if isinstance(stmt.value, A.DictLit):
+                if not dicts.is_dict(stmt.declared_type or ""):
+                    raise SemanticError(
+                        f"line {stmt.line}: '{stmt.name}' is given a dict, so it "
+                        f"must be annotated, e.g. "
+                        f"`{stmt.name}: dict[str, int] = {{...}}`"
+                    )
+                if stmt.name in self.defined:
+                    raise SemanticError(
+                        f"line {stmt.line}: '{stmt.name}' is already a dict and "
+                        f"cannot be replaced with another — its keys are part of "
+                        f"its type. Assign to its entries instead."
+                    )
+                stmt.value.inferred_type = stmt.declared_type
+                self.symtab.declare_var(stmt.name, stmt.declared_type, stmt.line)
+                self.defined.add(stmt.name)
+                return
             if isinstance(stmt.value, A.New):
                 self._check_new(stmt)
                 return
@@ -724,6 +893,43 @@ class TypeChecker:
 
         elif isinstance(stmt, A.MethodCall):
             self._infer(stmt)
+
+        elif isinstance(stmt, A.ForKeys):
+            dict_type = self._dict_of(stmt.dict_name, stmt.line)
+            if dict_type is None:
+                raise SemanticError(
+                    f"line {stmt.line}: `for {stmt.var} in {stmt.dict_name}` needs "
+                    f"{stmt.dict_name!r} to be a dict; `for` otherwise iterates "
+                    f"over range(...) in this subset"
+                )
+            stmt.dict_name = self._dict_symbol(stmt.dict_name)
+            self.symtab.declare_var(stmt.var, dicts.key_type(dict_type), stmt.line)
+            self.defined.add(stmt.var)
+            self.loop_depth += 1
+            self._check_block(stmt.body, ret_type)
+            self.loop_depth -= 1
+
+        elif isinstance(stmt, A.IndexAssign) and self._dict_of(stmt.name,
+                                                               stmt.line):
+            dict_type = self._dict_of(stmt.name, stmt.line)
+            key_type = self._infer(stmt.index)
+            if key_type != dicts.key_type(dict_type):
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' has "
+                    f"{dicts.key_type(dict_type)} keys, so it cannot be indexed "
+                    f"with {key_type}"
+                )
+            want = dicts.value_type(dict_type)
+            value_type = self._infer(stmt.value)
+            if stmt.op:
+                value_type = self._binop_type(stmt.op, want, value_type,
+                                              stmt.value, stmt.line)
+            if value_type != want:
+                raise SemanticError(
+                    f"line {stmt.line}: '{stmt.name}' holds {want}, so {value_type} "
+                    f"cannot be stored in it"
+                )
+            stmt.kind = "dict"
 
         elif isinstance(stmt, A.IndexAssign):
             array_type = self._array_of(stmt.name, stmt.line)
@@ -930,6 +1136,8 @@ class TypeChecker:
             t = self._infer_call(expr)
         elif isinstance(expr, A.Index):
             t = self._infer_index(expr)
+        elif isinstance(expr, A.Contains):
+            t = self._infer_contains(expr)
         elif isinstance(expr, A.Attribute):
             t = self._infer_attribute(expr)
         elif isinstance(expr, A.AttributeIndex):
@@ -942,6 +1150,12 @@ class TypeChecker:
                 f"variable declared `{expr.class_name}`, e.g. "
                 f"`c: {expr.class_name} = {expr.class_name}()`. An object here is "
                 f"storage, not a reference that can be moved around."
+            )
+        elif isinstance(expr, A.DictLit):
+            raise SemanticError(
+                f"line {expr.line}: a dict literal may only initialise a variable "
+                f"declared `dict[...]`. Its keys are part of its type, so there is "
+                f"nowhere else one can go."
             )
         elif isinstance(expr, (A.ArrayLit, A.ArrayRepeat)):
             raise SemanticError(
@@ -1049,7 +1263,35 @@ class TypeChecker:
         # numeric type, so it can never silently truncate a real result.
         return "float"
 
+    def _infer_contains(self, expr: A.Contains):
+        dict_type = self._dict_of(expr.dict_name, expr.line)
+        if dict_type is None:
+            raise SemanticError(
+                f"line {expr.line}: `in` tests membership of a dict in this subset, "
+                f"and '{expr.dict_name}' is not one"
+            )
+        key_type = self._infer(expr.key)
+        if key_type != dicts.key_type(dict_type):
+            raise SemanticError(
+                f"line {expr.line}: '{expr.dict_name}' has "
+                f"{dicts.key_type(dict_type)} keys, so {key_type} cannot be in it"
+            )
+        expr.dict_name = self._dict_symbol(expr.dict_name)
+        return "bool"
+
     def _infer_index(self, expr: A.Index):
+        dict_type = self._dict_of(expr.name, expr.line)
+        if dict_type is not None:
+            key_type = self._infer(expr.index)
+            if key_type != dicts.key_type(dict_type):
+                raise SemanticError(
+                    f"line {expr.line}: '{expr.name}' has "
+                    f"{dicts.key_type(dict_type)} keys, so it cannot be indexed "
+                    f"with {key_type}"
+                )
+            expr.kind = "dict"
+            return dicts.value_type(dict_type)
+
         array_type = self._array_of(expr.name, expr.line)
         index_type = self._infer(expr.index)
         if index_type not in ("int", "bool"):
@@ -1074,6 +1316,9 @@ class TypeChecker:
                 )
             expr.kind = "constant"
             expr.class_name = info.name
+            if dicts.is_dict(thing.type):
+                expr.kind = "dict_constant"
+                expr.member = classes.method_symbol(info.name, expr.member)
             return thing.type
 
         info = self._class_of_owner(expr.owner, expr.line)
@@ -1085,9 +1330,28 @@ class TypeChecker:
                 f"needs parentheses to be called. A method is not a value here."
             )
         expr.kind = kind
+        if kind == "constant" and dicts.is_dict(thing.type):
+            # A class-level dict lives at file scope, so the node carries the
+            # symbol rather than a struct member.
+            expr.kind = "dict_constant"
+            expr.member = classes.method_symbol(info.name, expr.member)
         return thing.type
 
     def _infer_attribute_index(self, expr: A.AttributeIndex):
+        dotted = f"{expr.owner}.{expr.member}"
+        dict_type = self._dict_of(dotted, expr.line)
+        if dict_type is not None:
+            key_type = self._infer(expr.index)
+            if key_type != dicts.key_type(dict_type):
+                raise SemanticError(
+                    f"line {expr.line}: '{dotted}' has "
+                    f"{dicts.key_type(dict_type)} keys, so it cannot be indexed "
+                    f"with {key_type}"
+                )
+            expr.class_name = self._dict_symbol(dotted)
+            expr.kind = "dict"
+            return dicts.value_type(dict_type)
+
         info = self._class_of_owner(expr.owner, expr.line)
         kind, thing = self._member(info, expr.member, expr.line, expr.owner)
         if kind != "field" or not arrays.is_array(thing.type):

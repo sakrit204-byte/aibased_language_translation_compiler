@@ -85,6 +85,7 @@ class IndexAssign:
     value: object
     line: int
     op: str = None        # None for `=`, else "+", "-", "*", "/", "%"
+    kind: str = None      # "dict" when the target is a dict entry
 
 
 @dataclass
@@ -120,6 +121,28 @@ class For:
     step: object          # None when the source used the 1- or 2-argument form
     body: list
     line: int
+
+
+@dataclass
+class ForKeys:
+    """`for k in d:` — the keys of a dict, in insertion order.
+
+    Python has iterated dicts in insertion order since 3.7, and the keys here
+    are a fixed array in the order they were written, so the two agree.
+    """
+    var: str
+    dict_name: str
+    body: list
+    line: int
+
+
+@dataclass
+class Contains:
+    """`k in d`."""
+    key: object
+    dict_name: str
+    line: int
+    inferred_type: str = None
 
 
 @dataclass
@@ -228,13 +251,14 @@ class AttributeAssign:
 
 @dataclass
 class AttributeIndex:
-    """`obj.field[i]` — reading an element of an array field."""
+    """`obj.field[i]` — an array field's element, or a dict constant's entry."""
     owner: str
     member: str
     index: object
     line: int
     inferred_type: str = None
     class_name: str = None
+    kind: str = None      # "dict" when the member is a class-level dict
 
 
 @dataclass
@@ -271,9 +295,22 @@ class New:
 
 @dataclass
 class Index:
-    """`a[i]` as an expression."""
+    """`a[i]` as an expression — an array element or a dict entry."""
     name: str
     index: object
+    line: int
+    inferred_type: str = None
+    kind: str = None      # "dict" when the owner is a dict
+
+
+@dataclass
+class DictLit:
+    """`{"W": 0, "Y": 1}` — only valid as the initialiser of a dict.
+
+    The keys are literals and become part of the type; see semantic/dicts.py.
+    """
+    keys: list
+    values: list
     line: int
     inferred_type: str = None
 

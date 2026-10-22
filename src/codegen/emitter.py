@@ -20,6 +20,7 @@ nodes the semantic phase tagged `kind == "ai"`.
 from ..parser import ast_nodes as A
 from ..semantic import arrays
 from ..semantic import classes
+from ..semantic import dicts
 from ..semantic import arrays
 from .rules import (ZERO_VALUE, CodegenError, CodegenRules, array_declaration,
                     c_name, type_to_c)
@@ -111,9 +112,11 @@ USER_MAIN = "py_user_main"
 
 
 class Emitter:
-    def __init__(self, symtab, ai_resolver=None, profiles=(), class_info=None):
+    def __init__(self, symtab, ai_resolver=None, profiles=(), class_info=None,
+                 global_dicts=None):
         self.symtab = symtab
         self.class_info = class_info or {}
+        self.global_dicts = global_dicts or {}
         self.profiles = list(profiles)
         self.needs = set()
         self.ai_call_sites = 0
@@ -123,6 +126,7 @@ class Emitter:
         # arguments are arrays and must be followed by their length.
         self.rules.functions = symtab.functions
         self.rules.class_info = self.class_info
+        self.rules.global_dicts = self.global_dicts
 
     def _count_ai(self, ai_resolver):
         if ai_resolver is None:
@@ -172,6 +176,8 @@ class Emitter:
         parts = [prelude_for(self.needs)]
         if getattr(program, "classes", None):
             parts.append(self._emit_structs(program))
+        if self.global_dicts:
+            parts.append(self._emit_global_dicts())
         if self.profiles:
             parts.append(self._emit_profile_decls())
         if decls:
@@ -205,6 +211,24 @@ class Emitter:
                     out.append(f"{INDENT}{type_to_c(field.type)} "
                                f"{c_name(field.name)};\n")
             out.append(f"}} {node.name};\n")
+        return "".join(out)
+
+    def _emit_global_dicts(self) -> str:
+        """Class-level dicts, as file-scope arrays.
+
+        They are shared by every instance and nothing can write to them —
+        assigning to a class constant is a compile error — so one copy is
+        both correct and what Python does.
+        """
+        out = ["\n/* ---- class-level dicts: shared, read-only ---- */\n"]
+        for symbol, (t, node) in self.global_dicts.items():
+            keys = ", ".join(self.rules.expr(k) for k in node.keys)
+            values = ", ".join(self.rules.expr(v) for v in node.values)
+            n = dicts.size(t)
+            out.append(f"static const {type_to_c(dicts.key_type(t))} "
+                       f"{c_name(dicts.keys_name(symbol))}[{n}] = {{{keys}}};\n")
+            out.append(f"static const {type_to_c(dicts.value_type(t))} "
+                       f"{c_name(dicts.values_name(symbol))}[{n}] = {{{values}}};\n")
         return "".join(out)
 
     def _emit_profile_decls(self) -> str:
@@ -260,7 +284,9 @@ class Emitter:
         declared = self._declaration_order(fn, local_types, param_names)
         for name in declared:
             t = local_types[name]
-            if classes.is_instance(t):
+            if dicts.is_dict(t):
+                lines.extend(self._dict_declaration(fn, name, t))
+            elif classes.is_instance(t):
                 lines.append(f"{INDENT}{classes.class_of(t)} {c_name(name)};")
             elif arrays.is_array(t):
                 lines.append(f"{INDENT}{array_declaration(t, c_name(name))} = "
@@ -274,6 +300,28 @@ class Emitter:
         lines.extend(body)
         lines.append("}")
         return "\n".join(lines)
+
+    def _dict_declaration(self, fn, name, t):
+        """Two arrays: the keys, which are constant, and the values, which
+        are not. See semantic/dicts.py."""
+        node = None
+        for stmt in _walk_assignments(fn.body):
+            if isinstance(stmt, A.Assign) and stmt.name == name:
+                node = stmt.value
+                break
+        if not isinstance(node, A.DictLit):
+            return []
+        keys = ", ".join(self.rules.expr(k) for k in node.keys)
+        values = ", ".join(self.rules.expr(v) for v in node.values)
+        n = dicts.size(t)
+        key_c = type_to_c(dicts.key_type(t))
+        value_c = type_to_c(dicts.value_type(t))
+        return [
+            f"{INDENT}static const {key_c} "
+            f"{c_name(dicts.keys_name(name))}[{n}] = {{{keys}}};",
+            f"{INDENT}{value_c} "
+            f"{c_name(dicts.values_name(name))}[{n}] = {{{values}}};",
+        ]
 
     def _fill_array_field(self, target, node, indent):
         pad = INDENT * indent
@@ -428,7 +476,7 @@ class Emitter:
         pad = INDENT * indent
 
         if isinstance(node, A.Assign):
-            if isinstance(node.value, (A.ArrayLit, A.ArrayRepeat)):
+            if isinstance(node.value, (A.ArrayLit, A.ArrayRepeat, A.DictLit)):
                 # The declaration above already carries the initialiser list;
                 # C has no way to assign a whole array afterwards.
                 return []
@@ -461,7 +509,26 @@ class Emitter:
         if isinstance(node, A.MethodCall):
             return [f"{pad}{self.rules.method_call(node)};"]
 
+        if isinstance(node, A.ForKeys):
+            # Walk the key array in order, which is the order the keys were
+            # written, which is Python's insertion order.
+            target = node.dict_name
+            t = self.rules.dict_type_of(target)
+            n = dicts.size(t)
+            keys = c_name(dicts.keys_name(target))
+            counter = f"py_k{self._next_tmp()}"
+            lines = [f"{pad}for (py_int {counter} = 0; {counter} < {n}; "
+                     f"{counter}++) {{",
+                     f"{pad}{INDENT}{c_name(node.var)} = {keys}[{counter}];"]
+            lines.extend(self._emit_block(node.body, indent + 1))
+            lines.append(f"{pad}}}")
+            return lines
+
         if isinstance(node, A.IndexAssign):
+            if getattr(node, "kind", None) == "dict":
+                slot = self.rules.dict_slot(node.name, node.index)
+                op = f"{node.op}=" if node.op else "="
+                return [f"{pad}{slot} {op} {self.rules.expr(node.value)};"]
             target = f"{c_name(node.name)}[{self.rules.index_expr(node)}]"
             op = f"{node.op}=" if node.op else "="
             return [f"{pad}{target} {op} {self.rules.expr(node.value)};"]

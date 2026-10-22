@@ -220,6 +220,61 @@ static py_int py_abs_int(py_int v)
 """)
 
 
+_helper("py_dict_find_str", ["py_fatal"])("""
+/* Look a key up in a dict's key array.
+ *
+ * The keys are a fixed, compile-time list, so this is a scan rather than a
+ * hash — for the handful of keys a program in this subset has, a scan is
+ * faster than hashing, and it needs no allocator. The order of the array is
+ * the order the keys were written, which is what makes `for k in d` yield
+ * the same sequence as Python's insertion order. */
+static py_int py_dict_find_str(const py_str *keys, py_int n, py_str key)
+{
+    for (py_int i = 0; i < n; i++)
+        if (strcmp(keys[i], key) == 0) return i;
+    return -1;
+}
+""")
+
+
+_helper("py_dict_get_str", ["py_dict_find_str", "py_fatal"])("""
+static py_int py_dict_get_str(const py_str *keys, py_int n, py_str key)
+{
+    py_int i = py_dict_find_str(keys, n, key);
+    if (i < 0) {
+        char message[160];
+        snprintf(message, sizeof message, "KeyError: '%.100s'", key);
+        py_fatal(message);
+    }
+    return i;
+}
+""")
+
+
+_helper("py_dict_find_int")("""
+static py_int py_dict_find_int(const py_int *keys, py_int n, py_int key)
+{
+    for (py_int i = 0; i < n; i++)
+        if (keys[i] == key) return i;
+    return -1;
+}
+""")
+
+
+_helper("py_dict_get_int", ["py_dict_find_int", "py_fatal"])("""
+static py_int py_dict_get_int(const py_int *keys, py_int n, py_int key)
+{
+    py_int i = py_dict_find_int(keys, n, key);
+    if (i < 0) {
+        char message[80];
+        snprintf(message, sizeof message, "KeyError: %lld", (long long)key);
+        py_fatal(message);
+    }
+    return i;
+}
+""")
+
+
 _helper("py_index", ["py_fatal"])("""
 /* Array subscripting with Python's rules rather than C's.
  *

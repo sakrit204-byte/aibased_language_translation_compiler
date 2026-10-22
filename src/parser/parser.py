@@ -13,6 +13,7 @@ Two details that are easy to get wrong and are handled explicitly here:
 from . import ast_nodes as A
 from ..semantic import arrays
 from ..semantic import classes
+from ..semantic import dicts
 from ..lexer.tokens import TYPE_NAMES
 
 
@@ -325,6 +326,8 @@ class Parser:
             return "None"
         if t.kind == "NAME" and t.value == "list":
             return self.parse_array_type()
+        if t.kind == "NAME" and t.value == "dict":
+            return self.parse_dict_type()
         if t.kind == "NAME" and t.value in TYPE_NAMES:
             self.pos += 1
             return t.value
@@ -381,6 +384,35 @@ class Parser:
             return arrays.make(inner.value, count)
         self.eat("RBRACKET")
         return arrays.make(inner.value)
+
+    def parse_dict_type(self):
+        """`dict[str, int]`. The size comes from the initialiser, as an
+        array's does, because the key set is part of the type."""
+        line = self.eat("NAME").value and self.tokens[self.pos - 1].line
+        if not self.at("LBRACKET"):
+            raise ParseError(
+                f"line {line}: `dict` needs its key and value types here, "
+                f"e.g. `dict[str, int]`"
+            )
+        self.eat("LBRACKET")
+        key = self.cur()
+        if key.kind != "NAME" or key.value not in dicts.KEY_TYPES:
+            raise ParseError(
+                f"line {line}: {key.value!r} is not a key type "
+                f"(expected {' or '.join(dicts.KEY_TYPES)})"
+            )
+        self.pos += 1
+        self.eat("COMMA")
+        value = self.cur()
+        if value.kind != "NAME" or value.value not in dicts.VALUE_TYPES:
+            raise ParseError(
+                f"line {line}: {value.value!r} is not a dict value type "
+                f"(expected one of {', '.join(dicts.VALUE_TYPES)}) — a dict here "
+                f"holds numbers and strings, not lists or other dicts"
+            )
+        self.pos += 1
+        self.eat("RBRACKET")
+        return dicts.make(key.value, value.value, 0)
 
     def parse_block(self, allow_docstring=False):
         self.eat("NEWLINE")
@@ -593,11 +625,32 @@ class Parser:
         line = self.eat("KEYWORD", "for").line
         var = self.eat("NAME").value
         self.eat("KEYWORD", "in")
+        if (self.at("NAME") and self.nxt().kind == "DOT"
+                and self.nxt(2).kind == "NAME" and self.nxt(3).kind == "COLON"):
+            owner = self.eat("NAME").value
+            self.eat("DOT")
+            member = self.eat("NAME").value
+            self.eat("COLON")
+            body = self.parse_block()
+            if self.at_kw("else"):
+                raise ParseError(
+                    f"line {self.cur().line}: for/else is not part of this subset")
+            return A.ForKeys(var, f"{owner}.{member}", body, line)
+        if self.at("NAME") and not self.at_name("range") and self.nxt().kind == "COLON":
+            # `for k in d:` — a dict's keys. Any other name is an error the
+            # semantic phase gives, since only it knows what the name holds.
+            target = self.eat("NAME").value
+            self.eat("COLON")
+            body = self.parse_block()
+            if self.at_kw("else"):
+                raise ParseError(
+                    f"line {self.cur().line}: for/else is not part of this subset")
+            return A.ForKeys(var, target, body, line)
         if not self.at_name("range"):
             t = self.cur()
             raise ParseError(
-                f"line {t.line}: `for` may only iterate over range(...) in this subset "
-                f"(there are no sequence types), found {t.value!r}"
+                f"line {t.line}: `for` iterates over range(...) or a dict in this "
+                f"subset, found {t.value!r}"
             )
         self.eat("NAME", "range")
         self.eat("LPAREN")
@@ -681,8 +734,27 @@ class Parser:
             return A.UnaryOp("not", self.parse_bool_not(), line)
         return self.parse_comparison()
 
+    def parse_membership(self, left, line):
+        """`k in d` — only a dict is on the right, which is why the name is
+        taken literally here rather than parsed as an expression."""
+        self.eat("KEYWORD", "in")
+        t = self.cur()
+        if t.kind != "NAME":
+            raise ParseError(
+                f"line {line}: `in` tests membership of a dict in this subset, so "
+                f"the right-hand side must be a dict's name, not {t.value!r}"
+            )
+        self.pos += 1
+        name = t.value
+        if self.at("DOT"):
+            self.eat("DOT")
+            name = f"{name}.{self.eat('NAME').value}"
+        return A.Contains(left, name, line)
+
     def parse_comparison(self):
         left = self.parse_arith()
+        if self.at_kw("in"):
+            return self.parse_membership(left, self.cur().line)
         if self.cur().kind in CMP_OPS:
             op_tok = self.take()
             right = self.parse_arith()
@@ -768,6 +840,8 @@ class Parser:
             return A.Name(t.value, t.line)
         if t.kind == "LBRACKET":
             return self.parse_array_literal()
+        if t.kind == "LBRACE":
+            return self.parse_dict_literal()
         if t.kind == "LPAREN":
             self.eat("LPAREN")
             expr = self.parse_expression()
@@ -776,6 +850,35 @@ class Parser:
             self.eat("RPAREN")
             return expr
         raise ParseError(f"line {t.line}: unexpected token {t.kind} {t.value!r}")
+
+    def parse_dict_literal(self):
+        """`{"W": 0, "Y": 1}`. Keys must be literals: they become part of the
+        type, so they have to be known while compiling."""
+        line = self.eat("LBRACE").line
+        keys, values = [], []
+        if not self.at("RBRACE"):
+            while True:
+                key = self.parse_expression()
+                self.eat("COLON")
+                values.append(self.parse_expression())
+                keys.append(key)
+                if not self.at("COMMA"):
+                    break
+                self.eat("COMMA")
+                if self.at("RBRACE"):           # trailing comma
+                    break
+        self.eat("RBRACE")
+        if not keys:
+            raise ParseError(
+                f"line {line}: an empty dict has no key set, and the keys are part "
+                f"of the type here — write out the entries it will have"
+            )
+        if len(keys) > MAX_ARRAY_SIZE:
+            raise ParseError(
+                f"line {line}: {len(keys)} entries is beyond this subset's limit "
+                f"of {MAX_ARRAY_SIZE}"
+            )
+        return A.DictLit(keys, values, line)
 
     def parse_array_literal(self):
         """`[1, 2, 3]` or `[0] * 54`.

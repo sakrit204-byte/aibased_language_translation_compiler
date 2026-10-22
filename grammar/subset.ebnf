@@ -39,7 +39,9 @@ function_def   = "def" IDENT "(" [ param_list ] ")" "->" type ":" block ;
 
 param_list     = param { "," param } ;
 param          = IDENT ":" type ;
-type           = "int" | "float" | "str" | "bool" | "None" | array_type ;
+type           = "int" | "float" | "str" | "bool" | "None"
+               | array_type | dict_type | IDENT ;
+                 (* IDENT: a class defined above this point *)
 
 (* ------------------------------------------------------------------ *)
 (* Fixed-size arrays are the one compound type here. The size is part  *)
@@ -52,7 +54,23 @@ type           = "int" | "float" | "str" | "bool" | "None" | array_type ;
 (* the pointer and its length, and len() reads the second.             *)
 (* ------------------------------------------------------------------ *)
 
-array_type     = "list" "[" ( "int" | "float" | "bool" ) "]" ;
+array_type     = "list" "[" ( "int" | "float" | "bool" ) [ "," NUMBER ] "]" ;
+                 (* the size is required on a class field, where the array *)
+                 (* is storage inside the struct                            *)
+
+(* ------------------------------------------------------------------ *)
+(* A dict has a fixed key set: the keys are literals and become part   *)
+(* of the type, so there is no growth, no rehash and no allocator. It  *)
+(* compiles to two arrays, the keys const and the values not.          *)
+(* Iteration is in the order the keys were written, which is Python's  *)
+(* insertion order — the property that lets a dict exist here at all.  *)
+(* ------------------------------------------------------------------ *)
+
+dict_type      = "dict" "[" ( "str" | "int" ) ","
+                 ( "int" | "float" | "bool" | "str" ) "]" ;
+
+dict_init      = "{" key ":" expression { "," key ":" expression } [ "," ] "}" ;
+key            = STRING | NUMBER ;
 
 array_init     = "[" expression { "," expression } [ "," ] "]"
                | "[" expression "]" "*" NUMBER ;

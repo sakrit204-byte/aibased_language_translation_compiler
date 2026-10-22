@@ -108,9 +108,11 @@ def test_blank_and_comment_lines_do_not_affect_indentation():
     assert toks.count("DEDENT") == 1
 
 
-def test_unsupported_syntax_is_named():
-    with pytest.raises(LexError, match="dict/set"):
-        Lexer("x = {1}\n").tokenize()
+def test_braces_lex_now_that_dicts_exist():
+    """`{` and `}` reach the parser, which has the context to tell a dict
+    literal from a set — there are no sets, so it says so itself."""
+    kinds = [t.kind for t in Lexer('x = {"a": 1}\n').tokenize()]
+    assert "LBRACE" in kinds and "RBRACE" in kinds
 
 
 def test_brackets_lex_now_that_arrays_exist():

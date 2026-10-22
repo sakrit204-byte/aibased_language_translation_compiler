@@ -47,13 +47,12 @@ OPERATORS_1 = {
     "(": "LPAREN", ")": "RPAREN", ":": "COLON", ",": "COMMA", "=": "ASSIGN",
     "<": "LT", ">": "GT", ".": "DOT",
     "[": "LBRACKET", "]": "RBRACKET",
+    "{": "LBRACE", "}": "RBRACE",
 }
 
 # Characters that are valid Python but outside this subset. Reporting them by
 # name is far more useful than "unexpected character '['".
 UNSUPPORTED = {
-    "{": "dict/set syntax",
-    "}": "dict/set syntax",
 
     ";": "multiple statements on one line",
     "&": "bitwise operators",
@@ -388,9 +387,9 @@ class Lexer:
         one = self.peek()
         if one in OPERATORS_1:
             self.advance()
-            if one in ("(", "["):
+            if one in ("(", "[", "{"):
                 self.paren_depth += 1
-            elif one in (")", "]"):
+            elif one in (")", "]", "}"):
                 if self.paren_depth == 0:
                     self.error("unmatched '%s'" % one, start_line)
                 self.paren_depth -= 1

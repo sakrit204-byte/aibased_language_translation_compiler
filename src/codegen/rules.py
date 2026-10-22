@@ -13,6 +13,7 @@ import re
 from ..parser import ast_nodes as A
 from ..semantic import arrays
 from ..semantic import classes
+from ..semantic import dicts
 
 C_TYPE = {
     "int": "py_int",
@@ -143,6 +144,8 @@ class CodegenRules:
         self.functions = {}
         # name -> classes.ClassInfo, for field offsets and method symbols.
         self.class_info = {}
+        # C symbol -> (type, literal) for class-level dicts.
+        self.global_dicts = {}
         # Maps a Python function name to the C symbol the emitter gave it.
         # `main` needs special handling: C's entry point has a fixed signature.
         self.func_name = func_name
@@ -164,13 +167,19 @@ class CodegenRules:
             if classes.is_instance(self.local_types.get(node.id, "")):
                 return self.receiver(node.id)
             return c_name(node.id)
+        if isinstance(node, A.Contains):
+            return self.dict_contains(node.dict_name, node.key)
         if isinstance(node, A.Index):
+            if getattr(node, "kind", None) == "dict":
+                return self.dict_lookup(node.name, node.index)
             return f"{c_name(node.name)}[{self.index_expr(node)}]"
         if isinstance(node, A.Attribute):
             if node.kind == "constant":
                 return self.class_constant(node.class_name, node.member)
             return self.field(node.owner, node.member)
         if isinstance(node, A.AttributeIndex):
+            if getattr(node, "kind", None) == "dict":
+                return self.dict_lookup(node.class_name, node.index)
             target = self.field(node.owner, node.member)
             self.request("py_index")
             length = self.field_length(node.class_name, node.member)
@@ -273,6 +282,38 @@ class CodegenRules:
             # C's == on `const char*` compares addresses, not contents.
             return f"(strcmp({left}, {right}) {node.op} 0)"
         return f"({left} {node.op} {right})"
+
+    # --------------------------------------------------------------- dicts
+
+    def dict_type_of(self, name):
+        """A dict is either a local or a class-level one, which lives at file
+        scope because it is shared and never written."""
+        if name in self.global_dicts:
+            return self.global_dicts[name][0]
+        return self.type_of_name(name)
+
+    def dict_lookup(self, name, key_node):
+        """`d[k]` — find the key's slot, then read the value beside it."""
+        t = self.dict_type_of(name)
+        kind = dicts.key_type(t)
+        helper = f"py_dict_get_{kind}"
+        self.request(helper)
+        keys = c_name(dicts.keys_name(name))
+        values = c_name(dicts.values_name(name))
+        n = dicts.size(t)
+        return f"{values}[{helper}({keys}, {n}, {self.expr(key_node)})]"
+
+    def dict_slot(self, name, key_node):
+        """The same, as an assignable slot."""
+        return self.dict_lookup(name, key_node)
+
+    def dict_contains(self, name, key_node):
+        t = self.dict_type_of(name)
+        helper = f"py_dict_find_{dicts.key_type(t)}"
+        self.request(helper)
+        keys = c_name(dicts.keys_name(name))
+        n = dicts.size(t)
+        return f"({helper}({keys}, {n}, {self.expr(key_node)}) >= 0)"
 
     # ------------------------------------------------------------- classes
 
@@ -421,9 +462,14 @@ class CodegenRules:
 
         if name == "len":
             target = node.args[0]
-            if isinstance(target, A.Name) and arrays.is_array(
-                    self.local_types.get(target.id, "")):
-                return self.array_length(target.id)
+            if isinstance(target, A.Attribute) and target.kind == "dict_constant":
+                return str(dicts.size(self.global_dicts[target.member][0]))
+            if isinstance(target, A.Name):
+                t = self.local_types.get(target.id, "")
+                if arrays.is_array(t):
+                    return self.array_length(target.id)
+                if dicts.is_dict(t):
+                    return str(dicts.size(t))
             return f"(py_int)strlen({args[0]})"
 
         if name == "put":

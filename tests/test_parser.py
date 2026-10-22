@@ -123,12 +123,13 @@ def test_trailing_comma_in_a_call():
     ("def f():\n    return 1\n", "explicit return-type annotation"),
     ("x = 1\n", "allowed at module level"),
     ("def f() -> None:\n    def g() -> None:\n        pass\n", "nested function"),
-    ("def f() -> None:\n    for x in y:\n        pass\n", "only iterate over range"),
+    ("def f() -> None:\n    for x in 1:\n        pass\n", "iterates over range"),
     ("def f() -> None:\n    x = print(1)\n", "only be used as a statement"),
     ("def f() -> None:\n    1 + 2\n", "no effect"),
     ("def f() -> None:\n    while 1:\n        pass\n    else:\n        pass\n", "while/else"),
     ("def f() -> list:\n    pass\n", "needs an element type"),
-    ("def f() -> dict:\n    pass\n", "not a type in this subset"),
+    ("def f() -> dict:\n    pass\n", "needs its key and value types"),
+    ("def f() -> set:\n    pass\n", "not a type in this subset"),
 ])
 def test_rejections_explain_themselves(source, message):
     with pytest.raises(ParseError, match=message):
