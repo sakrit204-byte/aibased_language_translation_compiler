@@ -220,6 +220,27 @@ def test_a_rewrite_is_accepted_only_after_its_output_is_compared(monkeypatch):
 
 
 @needs_c_compiler
+def test_build_and_capture_returns_raw_bytes_for_each_run(monkeypatch):
+    """What the repair window's Run button uses to repeat the comparison by
+    hand: the same build, the same byte capture, however many runs asked for."""
+    _stub(monkeypatch, GOOD_REWRITE)
+    _, report = R.repair(ORIGINAL, error="line 3: enumerate")
+
+    error, runs = R.build_and_capture(report["c_code"], link=report.get("link"),
+                                      runs=3)
+    assert error is None
+    assert len(runs) == 3
+    assert all(out == report["reference"]["raw"] for _, out, _ in runs)
+    assert all(isinstance(out, bytes) for _, out, _ in runs)
+
+
+@needs_c_compiler
+def test_build_and_capture_reports_a_build_failure_rather_than_raising():
+    error, runs = R.build_and_capture("int main(void) { not C }\n")
+    assert error and runs == []
+
+
+@needs_c_compiler
 def test_acceptance_names_every_run_that_was_compared(monkeypatch):
     """Four agreeing runs, not one: the original twice, the rewrite under
     CPython, and the compiled C twice. A bug in the model and a matching bug

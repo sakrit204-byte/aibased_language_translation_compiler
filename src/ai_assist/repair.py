@@ -458,6 +458,9 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
     report["reference"] = {
         "exit": reference["exit"],
         "stdout": reference["stdout"].decode("utf-8", "replace"),
+        # The bytes themselves, not just their text form: a caller that wants
+        # to repeat the comparison has to compare what was compared.
+        "raw": reference["stdout"],
         "lines": len(reference["stdout"].splitlines()),
         "bytes": len(reference["stdout"]),
         # Shown as evidence: two outputs with the same digest are the same

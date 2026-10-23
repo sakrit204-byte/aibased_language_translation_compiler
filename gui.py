@@ -727,6 +727,7 @@ class RepairWindow(tk.Toplevel):
         self.repaired = None
         self.report = None
         self._syncing = False
+        self._running = False
         self._buttons = []
 
         self.title("AI repair — the failure on the left, the resolve on the right")
@@ -834,6 +835,15 @@ class RepairWindow(tk.Toplevel):
         self.sync_switch = Switch(self.footer, "Lock scrolling", self.sync_var,
                                   self.app.theme, font=self.app.font_small)
         self.sync_switch.pack(side="left", padx=16, pady=12)
+
+        # The verdict above was settled when the repair was accepted. This
+        # repeats that comparison on demand, so it can be watched rather than
+        # taken on trust — and so the C can be run from the window that claims
+        # something about it.
+        self.run_button = self._button("▶  Run both and compare", self.run_both,
+                                       padx=14, pady=6)
+        self.run_button.pack(side="left", padx=4, pady=10)
+        self.run_button.set_enabled(False)
 
         self.close_button = self._button("Close", self.close)
         self.close_button.pack(side="right", padx=(4, 16), pady=10)
@@ -981,7 +991,7 @@ class RepairWindow(tk.Toplevel):
                              "bytes"),
             "warn" if vacuous else "ok")
         self._show_sides(repaired)
-        for button in (self.apply_button, self.save_button):
+        for button in (self.apply_button, self.save_button, self.run_button):
             button.set_enabled(True)
 
         self.write("\n" + "─" * 70 + "\n", "dim")
@@ -1068,6 +1078,86 @@ class RepairWindow(tk.Toplevel):
                 text=f"Repair — verified  ({added} line(s) in their place)")
         self.write(f"\n{removed} line(s) replaced by {added}; the rest is "
                    f"untouched and is shown on the same row.\n", "dim")
+
+    # -- running both, here ---------------------------------------------
+
+    def run_both(self):
+        """Run your program under CPython and the compiled C, side by side.
+
+        This is the same comparison the verdict rests on, repeated on demand.
+        It builds the C from the accepted repair and diffs the raw bytes, so
+        the claim in the band above can be watched happening rather than
+        believed.
+        """
+        if self._running or not (self.report or {}).get("c_code"):
+            return
+        self._running = True
+        self.run_button.set_enabled(False)
+        self.write("\n" + "─" * 70 + "\n", "dim")
+        self.write("Running both, now\n", "head")
+        self.write("  building the C and running it, and running your original "
+                   "under CPython…\n", "dim")
+        threading.Thread(target=self._run_worker, daemon=True).start()
+
+    def _run_worker(self):
+        from src.ai_assist.repair import build_and_capture, run_python
+
+        report = self.report or {}
+        try:
+            py_exit, py_out, _ = run_python(self.source)
+            build_error, runs = build_and_capture(
+                report["c_code"], link=report.get("link"), runs=1)
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            self.app.root.after(0, lambda: self._run_failed(message))
+            return
+        self.app.root.after(
+            0, lambda: self._run_done(py_exit, py_out, build_error, runs))
+
+    def _run_failed(self, message):
+        self._running = False
+        try:
+            self.run_button.set_enabled(True)
+            self.write(f"  could not run them: {message}\n", "err")
+        except tk.TclError:
+            pass
+
+    def _run_done(self, py_exit, py_out, build_error, runs):
+        import hashlib
+
+        self._running = False
+        try:
+            self.run_button.set_enabled(True)
+        except tk.TclError:
+            return
+
+        if build_error:
+            self.write("  the C did not build:\n", "err")
+            self.write(build_error[:800] + "\n", "err")
+            return
+
+        c_exit, c_out, c_err = runs[0]
+        for command, out, code in (
+                ("python your_program.py", py_out, py_exit),
+                ("cc repair.c -lm -o repair  &&  ./repair", c_out, c_exit)):
+            self.write(f"\n  $ {command}\n", "cmd")
+            text = out.decode("utf-8", "replace")
+            self.write(text if text.endswith("\n") or not text else text + "\n", "")
+            self.write(f"  [exit {code}]\n", "dim")
+
+        if py_out == c_out and py_exit == c_exit:
+            self.write(f"\n  identical: {len(py_out)} bytes either way, both "
+                       f"exit {py_exit}\n", "ok")
+            self.write(f"  sha256 {hashlib.sha256(py_out).hexdigest()}\n", "dim")
+            if c_err:
+                self.write("  (the C also wrote to stderr; stdout is what is "
+                           "compared)\n", "warn")
+        else:
+            from src.ai_assist.repair import first_difference
+            self.write("\n  DIFFERENT — this should not happen; the repair was "
+                       "accepted on this comparison:\n", "err")
+            self.write("  " + first_difference(py_out, c_out, py_exit, c_exit)
+                       + "\n", "err")
 
     # -- actions --------------------------------------------------------
 

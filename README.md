@@ -246,8 +246,33 @@ right. Underneath is the evidence — the error that stopped the compiler, the
 stage that rejected each attempt, the output both programs produce, and the
 four runs that were compared.
 
+**Run both and compare** runs your original under CPython and builds and runs
+the C right there, prints both outputs, and diffs the raw bytes - the same
+comparison the verdict rests on, repeated on demand so it can be watched rather
+than believed:
+
+```
+  $ python your_program.py
+sum of squares 1..10 = 385
+  ...
+  [exit 0]
+
+  $ cc repair.c -lm -o repair  &&  ./repair
+sum of squares 1..10 = 385
+  ...
+  [exit 0]
+
+  identical: 115 bytes either way, both exit 0
+  sha256 3b5c6b6c292f807d940fdc2e80e9fa3dc0d516729e741887229fcc9701217eb9
+```
+
 **Use this repair** puts the rewrite in the source pane and translates it again
 as an ordinary translation. It is never applied silently.
+
+The window opens by itself only when a translation **fails** and AI-assist is
+on - there is nothing to compare when one succeeds. With the switch off, the
+Pipeline tab says so and the toolbar's **✦ Repair** button starts the same thing
+by hand.
 
 ### When repair is refused
 
