@@ -17,6 +17,10 @@ import sys
 import tempfile
 
 from .ai_assist import client as ai_client
+# Safe at module level: repair.py imports nothing from here until it is called,
+# and it needs the driver, so the dependency only ever points one way at import
+# time.
+from .ai_assist import repair as repair_module
 from .ai_assist.gate import AIAssistError, Gate
 from .codegen.emitter import Emitter
 from .codegen.rules import CodegenError
@@ -257,6 +261,11 @@ def main(argv=None):
     ap.add_argument("--repair-out",
                     help="where to write an accepted repair "
                          "(default: <source>.repaired.py)")
+    ap.add_argument("--repair-attempts", type=int, default=None,
+                    metavar="N",
+                    help="how many rewrites to try before giving up "
+                         f"(default: {repair_module.MAX_ATTEMPTS}). An attempt "
+                         "is only spent when the one before it was rejected.")
     args = ap.parse_args(argv)
 
     if args.ai and args.no_ai:
@@ -284,7 +293,7 @@ def main(argv=None):
         print(f"{args.source}: {e}", file=sys.stderr)
         if not args.repair:
             return 1
-        source, c_code, stats, results = _repair(args, source, str(e))
+        source, c_code, stats, results = _repair(args, source, str(e), use_ai)
         if source is None:
             return 1
 
@@ -349,12 +358,18 @@ def _plain(text):
     return text
 
 
-def _repair(args, source, error):
+def _repair(args, source, error, use_ai=False):
     """Run the source-level repair after a failed translation.
 
     Returns (repaired_source, c_code, stats, results), or four Nones when
     nothing was accepted. The repaired program is written out so the diff is
     reviewable rather than something the compiler quietly used.
+
+    `use_ai` is passed on so a candidate is compiled under the same rules as
+    the original was: with --ai the gate is available to it, and without it
+    the candidate has to be fully static. The IDE already did this; here it
+    was being dropped, so --ai --repair quietly judged the rewrite by
+    stricter rules than --ai alone.
     """
     from .ai_assist.repair import repair as repair_source
 
@@ -365,6 +380,7 @@ def _repair(args, source, error):
     print("\nattempting an AI repair of the source\n", file=sys.stderr)
     repaired, report = repair_source(
         source, error=error, model=args.model, log_path=args.ai_log,
+        use_ai=use_ai, attempts=args.repair_attempts or repair_module.MAX_ATTEMPTS,
         progress=progress,
     )
     if not repaired:
@@ -390,7 +406,9 @@ def _repair(args, source, error):
     print(_plain(f"\nrepair accepted: {report['reason']}"), file=sys.stderr)
     print(f"wrote {out}", file=sys.stderr)
 
-    c_code, stats, results = compile_source_detailed(repaired)
+    c_code, stats, results = compile_source_detailed(
+        repaired, use_ai=use_ai, model=args.model, log_path=args.ai_log,
+        cache_path=args.ai_cache)
     return repaired, c_code, stats, results
 
 

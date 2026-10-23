@@ -193,6 +193,11 @@ reaches the C compiler: only the C that *this compiler* emitted is ever built.
 python -m src.driver demos/repair_me.py --repair --run
 ```
 
+Up to five rewrites are tried, each told everything the earlier ones got wrong;
+`--repair-attempts N` raises or lowers that. An attempt is only spent when the
+one before it was rejected, so a program that lands on the first try costs one
+model call whatever the ceiling is.
+
 The code it writes does not have to resemble yours. Only the output is
 checked, so the model is told to **reimplement, not transliterate** - and that
 it must not try to reproduce a construct the subset lacks. A decorated function
@@ -333,15 +338,61 @@ a window or waits for events cannot be repaired into this subset: there is
 nothing to compare a rewrite against.
 ```
 
-A program that needs a growable list, dynamic dispatch, or a library the
-generated C has no binding to gets the same answer by a different route: every
-rewrite either fails to compile or prints something else, and all three attempts
-are reported with the stage that rejected them.
+Those two are refusals *about the program*, and they cost nothing: both are
+decided by running the original twice, before a token is spent.
+
+Everything else is a question of whether the model finds a way, and the answer
+is measured rather than asserted — see **How much it actually lands** below.
+When it does not find one, every attempt is reported with the stage that
+rejected it, so the failure is legible instead of a shrug.
 
 `tests/test_repair.py` covers all of this with the model stubbed out, so it runs
 offline — including that a program which does not agree with itself is refused
 *without* a model call, and that a difference in line endings alone is still
 reported as a difference.
+
+### How much it actually lands
+
+"It handles any program" is an opinion. `tests/corpus/` makes it a number:
+twelve ordinary Python programs the compiler refuses, each verified to run
+cleanly and deterministically under CPython, so each is a fair question.
+`python -m tools.repair_bench` asks all of them.
+
+The first run landed **10 of 12**. Both failures burned every attempt at the
+*compile* stage, and in both cases the model was guessing at a restriction
+nothing had told it about:
+
+| what it guessed | what is true |
+|---|---|
+| `s[0]`, `for ch in s`, `ord()` | a `str` cannot be indexed, iterated or taken apart, and nothing here can build one at runtime |
+| `def f() -> list[int]` | a function cannot return an array — pass the destination in and return how many entries you filled |
+| `list[list[int]]` | arrays hold numbers only; a grid is one flat array indexed `row * width + col` |
+| `def f(a: list[int, 6])` | an array *parameter* is unsized — a sized one accepts that one length and nothing else, while `len(a)` works either way |
+
+None of that was written down anywhere the model could read, so it is now in
+the grammar it is given as spec, with a worked idiom for each in the prompt.
+The same run also exposed a diagnostic of ours that no one could have acted
+on: passing a `list[int, 3]` where a `list[int, 2]` was wanted reported
+`argument 1 of 'total' (a) is list[int], got list[int]`, naming the same type
+twice, because `describe()` dropped the size that was the entire problem.
+
+What the fixes bought, re-measured: `cipher` went from failing three times at
+the front end to landing, and the remaining failures moved from *compile* to
+*equivalence* — from "cannot say it" to "said it slightly wrong", which is the
+failure a retry can actually close. One more idiom came out of that: Python's
+`repr` of a list is an exact format, `[`, items joined by `", "`, `]`, and a
+rewrite that approximates it fails the byte comparison, so `write_list` is now
+given verbatim alongside `write_int`.
+
+Two caveats worth more than the headline number. The re-measurement stopped
+early when the provider ran out of credit, so four programs that passed before
+the prompt changes were not re-run against them. And although sampling is
+pinned to temperature 0, one run per program is thin evidence about any single
+program — `counting` passed before the changes and failed after. The aggregate
+is the signal; a single row is not.
+
+`matrix` and `counting` are open. Both compile and both get the output nearly
+right, which is recorded here rather than rounded off.
 
 ## Architecture
 
@@ -649,6 +700,15 @@ CPython exactly is how this compiler is tested.
   transcript in `reports/ai_invocation_log.md`.
 * `stats` from `compile_source` reports `total_call_sites`, `ai_calls_used`,
   `ai_queries` and `ai_cache_hits` for any program you want to measure.
+* `tests/corpus/` is the repair corpus: ordinary Python programs the
+  deterministic compiler refuses, each of which runs cleanly and
+  deterministically under CPython, so each is a fair question to put to
+  repair. `python -m tools.repair_bench` asks all of them and prints the
+  score; `tests/test_corpus.py` keeps the corpus honest offline, asserting
+  that every program still parses, is still refused by the compiler, defines
+  `main()` without calling it, and can still serve as a reference. A program
+  that stops being refused is the interesting failure there — it means the
+  subset grew, and the corpus should grow with it.
 
 ## Requirements
 

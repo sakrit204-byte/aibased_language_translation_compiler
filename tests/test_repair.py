@@ -411,7 +411,9 @@ def test_a_rewrite_that_prints_the_answer_is_refused_and_told_why(monkeypatch):
 @needs_c_compiler
 def test_a_rewrite_that_compiles_but_prints_something_else_is_refused(monkeypatch):
     _stub(monkeypatch, WRONG_REWRITE, WRONG_REWRITE, WRONG_REWRITE)
-    repaired, report = R.repair(ORIGINAL, error="line 3: enumerate")
+    # Pinned rather than left to the default: what is under test is that every
+    # attempt is spent and each is reported, not how many there are by default.
+    repaired, report = R.repair(ORIGINAL, error="line 3: enumerate", attempts=3)
 
     assert repaired is None
     assert not report["accepted"]

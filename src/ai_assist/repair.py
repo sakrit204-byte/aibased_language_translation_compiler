@@ -88,7 +88,13 @@ from . import client
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GRAMMAR_PATH = os.path.join(PROJECT_ROOT, "grammar", "subset.ebnf")
 
-MAX_ATTEMPTS = 3
+# Five rather than three because the benched failures were converging, not
+# stuck: the stage that rejected an attempt kept moving forward - safety, then
+# equivalence, then compile - and twice the third attempt was one letter or
+# one array size from being accepted. An attempt is only spent when the one
+# before it failed, so a program that lands on the first try costs the same as
+# it always did.
+MAX_ATTEMPTS = 5
 
 # A rewritten program is a whole file, and the model has to restate every line
 # it keeps. 12k leaves room for a few hundred lines of output plus whatever a
@@ -468,9 +474,111 @@ Hard rules for your answer:
   - print(a, b) separates its arguments with one space and ends the line, the
     same as Python's. If the original did not print a space there, do not use
     it - build the line with put() instead.
+  - `print(some_list)` in the original prints Python's repr of the list, which
+    is an exact format: "[", the items separated by ", " (comma AND space),
+    then "]". Nothing in the subset prints an array, so write this helper and
+    call it - getting the brackets or the separator slightly wrong is the most
+    common way a rewrite fails the output comparison:
+
+        def write_list(a: list[int], n: int) -> None:
+            put("[")
+            i: int = 0
+            while i < n:
+                if i > 0:
+                    put(", ")
+                write_int(a[i])
+                i += 1
+            put("]")
+
+    A list of lists nests the same way - "[", then each row written by
+    write_list with ", " between the rows, then "]":
+
+        def write_grid(m: list[int], rows: int, width: int) -> None:
+            put("[")
+            r: int = 0
+            while r < rows:
+                if r > 0:
+                    put(", ")
+                put("[")
+                c: int = 0
+                while c < width:
+                    if c > 0:
+                        put(", ")
+                    write_int(m[r * width + c])
+                    c += 1
+                put("]")
+                r += 1
+            put("]")
+
+    `print("label", xs)` is then: put("label "), write_list(...), print().
+    Note the single space after the label, which is what print() would have
+    put there.
+  - Python prints a bool as "True" or "False", not as 1 or 0. If the original
+    prints a bool, branch and put() the word.
   - Lists are fixed-size arrays of int, float or bool: `xs: list[int] = [0] * 9`
     or `xs: list[int, 9]` as a class field. No growth, no slicing, no list of
     strings.
+  - An array PARAMETER is declared WITHOUT a size - `a: list[int]`, never
+    `a: list[int, 6]`. A sized parameter accepts that one length and nothing
+    else, so `list[int, 6]` cannot be given a `list[int, 4]`; an unsized one
+    takes any length, and len(a) still reports the real length inside the
+    function. Pass the shape as plain ints when the function needs it:
+
+        def print_row(m: list[int], width: int, row: int) -> None:
+            c: int = 0
+            while c < width:
+                write_int(m[row * width + c])
+                c += 1
+
+    A local array and a class field do carry their size, because there the
+    size is known: `buf: list[int, 16] = [0] * 16`.
+  - A function CANNOT return an array. Pass the destination array in as a
+    parameter, fill it, and return how many entries you filled - an array
+    argument is the caller's own storage, exactly as in Python, so writing to
+    it is visible to the caller:
+
+        def squares(out: list[int, 16], count: int) -> int:
+            i: int = 0
+            while i < count:
+                out[i] = (i + 1) * (i + 1)
+                i += 1
+            return count
+
+        def main() -> int:
+            buf: list[int, 16] = [0] * 16
+            used: int = squares(buf, 5)
+            ...
+
+    This is also the answer to "a list whose length is not known": declare an
+    array big enough for the worst case and carry the count beside it. Loop to
+    `used`, not to the array's length.
+  - Arrays hold numbers only - there is no `list[list[int]]` and no
+    `list[str]`. A grid is one flat array with the index worked out:
+
+        grid: list[int, 6] = [0] * 6      # 2 rows of 3
+        grid[row * 3 + col] = value
+
+  - A str cannot be indexed, iterated or taken apart, and there is no ord()
+    and no chr(). `s[0]`, `for ch in s`, `s.upper()`, `s.split()` - none of
+    them exist, and nothing in the subset can build a str at runtime.
+    So text that the program works on is carried as NUMBERS, one per letter
+    (0 for "a" through 25 for "z"), in an array, and written out with a branch
+    table the same shape as write_int. Write out all 26 branches:
+
+        def put_letter(i: int) -> None:
+            if i == 0:
+                put("a")
+            elif i == 1:
+                put("b")
+            elif i == 2:
+                put("c")
+            ... one branch for every letter you can print ...
+            else:
+                put("z")
+
+    A literal that the original program also wrote as a literal stays a
+    literal - put("total: ") is fine and is not cheating. It is only the text
+    the program *computes* that has to become numbers.
   - A dict's keys are literals and fixed: `d: dict[str, int] = {"a": 1}`.
     Values can be assigned; keys cannot be added or removed.
   - If a value is a float, annotate it and write it as a float: `t: float = 0.0`,
