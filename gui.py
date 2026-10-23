@@ -940,6 +940,7 @@ class RepairWindow(tk.Toplevel):
         "model": "asking the model",
         "safety": "pre-compiler check",
         "compile": "the compiler",
+        "shortcut": "computed, not pasted",
         "build": "the C compiler",
         "verify": "comparing the output",
     }

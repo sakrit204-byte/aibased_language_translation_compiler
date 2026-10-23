@@ -193,6 +193,23 @@ reaches the C compiler: only the C that *this compiler* emitted is ever built.
 python -m src.driver demos/repair_me.py --repair --run
 ```
 
+The code it writes does not have to resemble yours. Only the output is
+checked, so the model is told to **reimplement, not transliterate** - and that
+it must not try to reproduce a construct the subset lacks. A decorated function
+is just a function; a comprehension is just a loop; an iterator is just an
+index. `demos/decorated.py` has a decorator factory, a closure, a class with a
+property and a staticmethod, a comprehension, a tuple and f-strings. Nothing
+survived the rewrite except the seven lines it prints:
+
+```python
+@traced("deposit")                     def deposit_traced(balance: int,
+def deposit(self, amount):                                amount: int) -> int:
+    self._balance += amount    ->          result: int = balance + amount
+    return self._balance                   put("deposit ")
+                                           write_int(amount)
+                                           ...
+```
+
 ### What has to be true before a repair is accepted
 
 Five things, in order, and all five:
@@ -235,6 +252,37 @@ the compiled C, run 2                   identical
 The one case where the argument does not hold is a program that prints nothing:
 matching "no output" is not evidence. The report marks that `vacuous` and says
 so rather than showing a tick.
+
+### The hole in "the output is the whole spec"
+
+If output is all that is checked, then for a program with **no input** the spec
+is satisfied by a program that prints the answer and computes nothing. It
+builds, it runs, its bytes match exactly - and nothing behavioural can tell it
+apart from a real translation, because there is no input to vary. So the check
+has to be on the text, and it rests on a property of the subset: **it cannot
+compute a string.** No concatenation, no `str()`, no formatting. Every piece of
+text in the output therefore came from a literal or is a number, and the only
+thing a rewrite can cheat at is printing a *number* it should have worked out.
+
+A candidate is rejected at the `shortcut` stage, before anything is run, when
+either holds:
+
+* it prints a run of **two or more digits** that appears in the expected output
+  and nowhere in your source - `385` when your program computed it;
+* it does **no arithmetic and no looping** at all and your program does - a
+  list of `print` statements rather than a translation.
+
+Both are retried with the reason, so the model is told what it did rather than
+just refused. Neither fires on an honest rewrite: a single digit is exempt
+(`write_int` legitimately prints `"0"` through `"9"`), a number already in your
+source is exempt, and text without digits is exempt - an earlier version of
+this check rejected `put("calling bump")`, where `bump` is a function name the
+original wrote and the subset has no introspection to recover. Hardcoding that
+is the correct translation, not a shortcut.
+
+Stated rather than papered over: a program whose every computed number is a
+single digit could in principle be pasted past the first rule. The second rule
+is what covers it, and `tests/test_repair.py` pins both.
 
 ### The comparison window
 

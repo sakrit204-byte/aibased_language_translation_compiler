@@ -147,6 +147,117 @@ def test_identical_bytes_report_no_difference():
     assert R.first_difference(b"a\n", b"a\n", 0, 0) == "no difference"
 
 
+# ------------------------------------------- computing it, not pasting it
+
+PRINTS = (
+    "def main() -> int:\n"
+    "    total: int = 0\n"
+    "    for i in range(1, 4):\n"
+    "        total += i\n"
+    '    put("total = ")\n'
+    "    print(total)\n"
+    "    return 0\n"
+)
+
+
+def test_printed_constants_sees_through_an_f_string():
+    source = ('def main() -> int:\n    n = 2\n    print(f"total = {n}")\n'
+              "    return 0\n")
+    assert "total = " in R.printed_constants(source)
+
+
+def test_printed_constants_sees_through_a_concatenation():
+    source = ('def main() -> int:\n    print("a" + str(1) + "b")\n    return 0\n')
+    assert set(R.printed_constants(source)) >= {"a", "b"}
+
+
+SUMS = (
+    "def main() -> int:\n"
+    "    total: int = 0\n"
+    "    for i in range(1, 28):\n"
+    "        total += i\n"
+    '    put("total = ")\n'
+    "    print(total)\n"
+    "    return 0\n"
+)
+
+
+def test_a_hardcoded_answer_is_caught():
+    """The hole in "the output is the whole spec": with no input to vary, a
+    program that prints the answer satisfies it completely. Nothing
+    behavioural can tell the two apart, so this check is on the text."""
+    cheat = 'def main() -> int:\n    print("total = 378")\n    return 0\n'
+    assert R.shortcut_literals(cheat, SUMS, "total = 378\n") == ["378"]
+
+
+def test_a_program_that_computes_the_answer_is_not_caught():
+    assert R.shortcut_literals(SUMS, SUMS, "total = 378\n") == []
+
+
+def test_a_digit_table_is_not_a_shortcut():
+    """write_int() prints "0".."9" and every one of them turns up in almost
+    any output. One digit is not evidence of anything."""
+    digits = ("def main() -> int:\n"
+              '    put("3")\n    put("7")\n    put("8")\n    return 0\n')
+    assert R.shortcut_literals(digits, SUMS, "total = 378\n") == []
+
+
+def test_a_number_the_original_already_wrote_is_not_a_shortcut():
+    """`28` is in the original's own source, so printing it is not something
+    the rewrite could only have got from the expected output."""
+    kept = ('def main() -> int:\n    put("28")\n    print()\n'
+            "    x: int = 1 + 1\n    return 0\n")
+    assert R.shortcut_literals(kept, SUMS, "28\n") == []
+
+
+def test_a_name_from_the_original_is_not_a_shortcut():
+    """The first version of this check rejected `put("calling bump")`, where
+    `bump` is a function name the original wrote and the subset has no
+    introspection to recover. Hardcoding it is the correct translation."""
+    original = ("def announce(f):\n    def wrapper(*a):\n"
+                '        print("calling", f.__name__)\n'
+                "        return f(*a)\n    return wrapper\n\n\n"
+                "def bump(n):\n    return n + 2\n\n\n"
+                "def main() -> int:\n    print(announce(bump)(3))\n    return 0\n")
+    rewrite = ('def main() -> int:\n    put("calling bump")\n    print()\n'
+               "    n: int = 3\n    print(n + 2)\n    return 0\n")
+    assert R.shortcut_literals(rewrite, original, "calling bump\n5\n") == []
+    assert not R.does_no_work(rewrite, original)
+
+
+def test_splitting_a_line_the_original_already_printed_is_not_a_shortcut():
+    split = ('def main() -> int:\n    put("total")\n    put(" = ")\n'
+             "    x: int = 1 + 1\n    print(x)\n    return 0\n")
+    assert R.shortcut_literals(split, SUMS, "total = 2\n") == []
+
+
+def test_a_list_of_prints_is_caught_even_when_every_number_is_one_digit():
+    """The half of the check that does not depend on digit counts: a rewrite
+    of a program that computes, which computes nothing itself, is a table."""
+    cheat = ('def main() -> int:\n    print("1")\n    print("2")\n'
+             "    return 0\n")
+    assert R.shortcut_literals(cheat, PRINTS, "1\n2\n") == []
+    assert R.does_no_work(cheat, PRINTS)
+
+
+def test_a_rewrite_that_still_computes_is_not_called_idle():
+    assert not R.does_no_work(PRINTS, PRINTS)
+
+
+def test_the_real_repair_of_the_demo_is_clean():
+    """A regression guard on the false-positive side: the rewrite that was
+    actually accepted must not trip the check."""
+    import os
+
+    from conftest import ROOT
+
+    demo = os.path.join(ROOT, "demos", "repair_me.py")
+    with open(demo, encoding="utf-8") as f:
+        original = f.read()
+    expected = R.reference_run(original)["stdout"].decode()
+    assert R.shortcut_literals(GOOD_REWRITE, original, expected) == []
+
+
 # --------------------------------------------------------- the whole machine
 
 ORIGINAL = (
@@ -275,6 +386,29 @@ def test_a_rewrite_that_prints_something_else_is_caught_before_any_c_is_built(
 
 
 @needs_c_compiler
+def test_a_rewrite_that_prints_the_answer_is_refused_and_told_why(monkeypatch):
+    """It compiles, it builds, and its bytes match exactly — and it is still
+    refused, because it did not do anything."""
+    cheat = ('def main() -> int:\n    print("0:2")\n    print("1:4")\n'
+             '    print("2:6")\n    return 0\n')
+    prompts = []
+
+    def fake_query(prompt, **kwargs):
+        prompts.append(prompt)
+        return cheat if len(prompts) == 1 else GOOD_REWRITE
+
+    monkeypatch.setattr(R.client, "query", fake_query)
+    repaired, report = R.repair(ORIGINAL, error="line 3: enumerate")
+
+    assert report["attempts"][0]["stage"] == "shortcut"
+    assert "no arithmetic and no looping" in report["attempts"][0]["reason"]
+    # and the retry is told exactly that, not just "rejected"
+    assert "paste it" in prompts[1]
+    # the honest rewrite that follows is accepted
+    assert repaired == GOOD_REWRITE
+
+
+@needs_c_compiler
 def test_a_rewrite_that_compiles_but_prints_something_else_is_refused(monkeypatch):
     _stub(monkeypatch, WRONG_REWRITE, WRONG_REWRITE, WRONG_REWRITE)
     repaired, report = R.repair(ORIGINAL, error="line 3: enumerate")
@@ -331,6 +465,9 @@ def test_a_silent_program_is_accepted_but_the_claim_is_marked_vacuous(monkeypatc
     assert report["accepted"]
     assert report["vacuous"]
     assert "proves only" in report["reason"]
+    # The shortcut check is skipped here on purpose: with no output there is
+    # nothing to paste, and folding `1 + 1` away changes nothing observable.
+    assert all(a["stage"] != "shortcut" for a in report["attempts"])
 
 
 def test_the_model_being_unreachable_is_reported_as_itself(monkeypatch):

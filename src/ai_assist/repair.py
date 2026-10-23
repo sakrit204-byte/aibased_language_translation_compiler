@@ -279,6 +279,109 @@ def check_candidate(source):
     return True, ""
 
 
+# --------------------------------------------------- printing vs computing
+
+#: A single digit is not evidence of anything: write_int() legitimately prints
+#: "0" through "9", and every one of them turns up in almost any output.
+SHORTCUT_MIN_DIGITS = 2
+
+_DIGIT_RUN = re.compile(r"\d+")
+
+
+def printed_constants(source):
+    """Every constant that reaches a print() or put() in `source`.
+
+    Constants nested inside an f-string or a `+` chain count — the literal
+    half of `f"total = {n}"` is text the program prints, and the point of
+    collecting these is to know what text the author wrote rather than
+    computed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        if name not in ("print", "put"):
+            continue
+        for argument in node.args:
+            for child in ast.walk(argument):
+                if isinstance(child, ast.Constant) and not isinstance(
+                        child.value, bool):
+                    if isinstance(child.value, (str, int, float)):
+                        found.append(str(child.value))
+    return found
+
+
+def shortcut_literals(candidate, original, expected):
+    """Numbers the rewrite prints as literals that the original never wrote.
+
+    This exists because of a real hole in "the output is the whole spec". For
+    a program that takes no input, that spec is satisfied by a program which
+    prints the answer and computes nothing: it builds, it runs, and its bytes
+    match exactly. No behavioural test can tell the two apart, because there
+    is no input to vary — so the check has to be on the text itself.
+
+    Which text, though, matters. The first version of this compared whole
+    printed strings and rejected `put("calling bump")` as copied, when `bump`
+    is a function name the original wrote and the subset has no introspection
+    to recover — hardcoding it is the *correct* translation, not a shortcut.
+
+    What is actually diagnostic is narrower, and it rests on a property of the
+    subset: **it cannot compute a string.** There is no concatenation, no
+    `str()`, no formatting. So every piece of text in the output either came
+    from a literal or is a number — and the only thing a rewrite can cheat at
+    is printing a *number* it should have worked out. So that is what is
+    checked: a run of two or more digits that the rewrite prints, that appears
+    in the expected output, and that is nowhere in the original's source.
+
+    `385` is caught. `"0"` from a digit table is not (one digit). `"bump"` is
+    not (no digits). `10` out of `range(1, 11)`'s neighbourhood is not — it is
+    in the original.
+
+    The hole this leaves, stated rather than papered over: a program whose
+    every computed number is a single digit could be pasted undetected. That
+    is what `does_no_work` below is for.
+    """
+    known = set(_DIGIT_RUN.findall(original))
+    suspects = []
+    for literal in printed_constants(candidate):
+        if literal not in expected:
+            continue
+        for run in _DIGIT_RUN.findall(literal):
+            if len(run) < SHORTCUT_MIN_DIGITS or run in known:
+                continue
+            if run not in suspects:
+                suspects.append(run)
+    return suspects
+
+
+def _computes(source):
+    """True when `source` does arithmetic, compares, or loops."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(isinstance(node, (ast.BinOp, ast.AugAssign, ast.Compare,
+                                 ast.For, ast.While))
+               for node in ast.walk(tree))
+
+
+def does_no_work(candidate, original):
+    """True when the original works something out and the rewrite only prints.
+
+    The second half of the shortcut check, and the half that does not depend
+    on how many digits a number has: a lookup table has no arithmetic and no
+    loop in it. A rewrite of a program that computes, which computes nothing
+    itself, is a table however short its numbers are.
+    """
+    return _computes(original) and not _computes(candidate)
+
+
 # ------------------------------------------------------------------ prompt
 
 def _grammar():
@@ -290,6 +393,22 @@ def _grammar():
 
 
 RULES = """\
+What is being asked of you:
+  - The OUTPUT must be identical. The CODE does not have to resemble the
+    original at all. Rewrite it, do not transliterate it: change the
+    algorithm, the loop shapes, the function names, the number of functions,
+    the data layout - whatever makes it expressible here.
+  - Do not try to reproduce a construct the subset does not have. There is no
+    decorator, no class hierarchy, no comprehension, no generator, and no
+    reason to simulate one. Work out what the code DOES and write that.
+    A decorated function is just a function; a comprehension is just a loop;
+    an iterator is just an index.
+  - Keep the computation. The one thing you may not do is print the expected
+    output as string literals. You have been shown what the program prints so
+    you can check yourself against it, not so you can paste it back - a
+    program that prints the answer instead of working it out is rejected, and
+    the rejection says so.
+
 Hard rules for your answer:
   - Reply with ONE complete Python file and nothing else: no prose, no fences,
     no explanation before or after.
@@ -361,16 +480,23 @@ Hard rules for your answer:
 
 def _prompt(source, error, survey, reference, previous=None):
     parts = [
-        "You are repairing a Python program so that a Python-to-C compiler can "
-        "translate it.\n\n"
+        "You are reimplementing a Python program so that a Python-to-C compiler "
+        "can translate it.\n\n"
         "The compiler accepts a strict subset of Python. The program below is "
-        "valid Python but uses constructs outside that subset, so translation "
-        "failed. Rewrite it so it is inside the subset AND prints exactly what "
-        "it prints now.\n\n",
+        "valid Python but is written with constructs outside that subset, so "
+        "translation failed. Write a program that is inside the subset and "
+        "prints exactly what this one prints.\n\n"
+        "Only the output has to match. The code is yours to write however the "
+        "subset allows - what it looks like does not matter and is not "
+        "checked.\n\n",
         "--- the compiler's error ---\n%s\n\n" % (error or "(none recorded)"),
     ]
     if survey:
-        parts.append("--- everything else outside the subset ---\n%s\n\n" % survey)
+        parts.append(
+            "--- the constructs that are in the way ---\n"
+            "These are listed so you know what to AVOID, not what to emulate. "
+            "Each one is a way of writing something, and the subset has another "
+            "way of writing the same thing.\n%s\n\n" % survey)
     if reference is not None:
         out = reference["stdout"].decode("utf-8", "replace")
         shown = out if len(out) <= 3000 else out[:3000] + "\n... (truncated)"
@@ -537,6 +663,43 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
         record["c_code"] = c_code
         record["link"] = results.get("link")
         say("compile", "it compiles — %d lines of C" % c_code.count("\n"), True)
+
+        # -- 2b. did it compute the answer, or paste it? -------------------
+        #
+        # For a program with no input, "prints the right bytes" is satisfied by
+        # a program that prints the right bytes and does nothing else. That
+        # would pass every check below it, so it has to be caught here, on the
+        # text, before any of them.
+        expected_text = reference["stdout"].decode("utf-8", "replace")
+        # A program that prints nothing has nothing to paste, and folding its
+        # arithmetic away changes nothing anyone can observe. Checking it here
+        # would only reject correct rewrites.
+        pasted, idle = [], False
+        if expected_text.strip():
+            pasted = shortcut_literals(candidate, source, expected_text)
+            idle = does_no_work(candidate, source)
+        if pasted or idle:
+            if pasted:
+                shown = ", ".join(repr(p) for p in pasted[:4])
+                reason = ("it prints the answer instead of working it out: %s "
+                          "%s copied from the expected output and %s nowhere "
+                          "in your program"
+                          % (shown, "were" if len(pasted) > 1 else "was",
+                             "are" if len(pasted) > 1 else "is"))
+            else:
+                shown = "(none)"
+                reason = ("it does no arithmetic and no looping, and the "
+                          "original does — it is a list of print statements, "
+                          "not a translation")
+            record.update(stage="shortcut", ok=False, reason=reason)
+            report["attempts"].append(record)
+            say("shortcut", reason, False)
+            previous = (
+                "Rejected: %s. The expected output was shown to you so you "
+                "could check yourself against it, not so you could paste it "
+                "back. Work the values out the way the original does."
+                % reason)
+            continue
 
         # -- 3. three-way agreement, on raw bytes --------------------------
         #
