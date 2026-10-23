@@ -71,10 +71,24 @@ def length_name(array_name):
 
 
 def describe(t):
-    """How to write the type in a message, in the source language."""
+    """How to write the type in a message, in the source language.
+
+    The size is part of the type, so it is part of the description. Leaving it
+    out produced the one kind of diagnostic nobody can act on — passing a
+    `list[int, 3]` where a `list[int, 2]` was wanted said "argument 1 of 'f'
+    (a) is list[int], got list[int]", naming the same type twice and hiding
+    the only thing that was wrong with it.
+
+    A parameter whose size is not known here still describes as `list[int]`,
+    because that is how it is written in the source and there is no number to
+    report.
+    """
     if not is_array(t):
         return t
-    return "list[%s]" % element(t)
+    declared = size(t)
+    if declared is None:
+        return "list[%s]" % element(t)
+    return "list[%s, %d]" % (element(t), declared)
 
 
 def compatible(source, target):

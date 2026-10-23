@@ -508,9 +508,23 @@ def _prompt(source, error, survey, reference, previous=None):
     parts.append("\n--- the subset's grammar ---\n%s\n" % _grammar())
     parts.append("\n--- the program to rewrite ---\n%s\n" % source)
     if previous:
-        parts.append(
-            "\n--- your previous answer was rejected ---\n%s\n"
-            "Fix that and reply with the whole file again.\n" % previous)
+        if isinstance(previous, str):
+            previous = [previous]
+        if len(previous) == 1:
+            parts.append(
+                "\n--- your previous answer was rejected ---\n%s\n"
+                "Fix that and reply with the whole file again.\n" % previous[0])
+        else:
+            lines = ["\n--- every answer you have given so far was rejected "
+                     "---\n"]
+            for index, item in enumerate(previous, 1):
+                lines.append("Attempt %d: %s\n\n" % (index, item))
+            lines.append(
+                "Those are all of them. Fix the latest one WITHOUT going back "
+                "to a mistake from an earlier one - each attempt was a whole "
+                "file, so re-reading this list is the only way to know what "
+                "you have already tried.\nReply with the whole file again.\n")
+            parts.append("".join(lines))
     return "".join(parts)
 
 
@@ -610,15 +624,24 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
     except Exception:
         pass
 
+    # Every rejection so far, not just the last one. An attempt that is only
+    # told about the previous answer is free to go back to the mistake before
+    # it, and with a whole-file rewrite that happens: the model fixes the line
+    # it was scolded about and reverts the rest. The list is what stops the
+    # attempts from cycling.
+    history = []
     previous = None
     for attempt in range(1, attempts + 1):
+        if previous:
+            history.append(previous)
+            previous = None
         record = {"attempt": attempt}
         trace = []
         say("model", "attempt %d: asking %s for a rewrite…"
             % (attempt, report["model"]))
         started = time.time()
         try:
-            raw = client.query(_prompt(source, error, survey, reference, previous),
+            raw = client.query(_prompt(source, error, survey, reference, history),
                                model=model, max_tokens=REPAIR_TOKEN_BUDGET,
                                timeout=REPAIR_TIMEOUT, trace=trace)
         except client.AIClientError as e:

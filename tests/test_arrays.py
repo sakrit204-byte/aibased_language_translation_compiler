@@ -83,8 +83,19 @@ def test_element_types_are_never_widened():
 
 
 def test_describe_speaks_the_source_language():
-    assert arrays.describe(arrays.make("int", 9)) == "list[int]"
     assert arrays.describe("int") == "int"
+    # Unsized is how a parameter is written, and there is no number to report.
+    assert arrays.describe(arrays.make("int")) == "list[int]"
+
+
+def test_describe_keeps_the_size_because_the_size_is_the_type():
+    """Two arrays of the same element type and different lengths are different
+    types, and a message that omits the length says "got list[int]" where it
+    expected "list[int]" — the same words for the thing that was wrong."""
+    assert arrays.describe(arrays.make("int", 9)) == "list[int, 9]"
+    assert arrays.describe(arrays.make("float", 2)) == "list[float, 2]"
+    assert (arrays.describe(arrays.make("int", 3))
+            != arrays.describe(arrays.make("int", 2)))
 
 
 # ------------------------------------------------------------- declaring
