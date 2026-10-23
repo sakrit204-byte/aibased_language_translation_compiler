@@ -1,0 +1,17 @@
+repair bench: 12 program(s), up to 3 attempt(s) each
+
+program      verdict  tries  seconds stages (* = failed)
+bignum       PASS     1      6.6     verified
+cipher       FAIL     3      14.0    compile* > compile* > compile*
+counting     PASS     3      20.4    compile* > equivalence* > verified
+generators   PASS     1      5.1     verified
+growing      PASS     1      5.6     verified
+inherit      PASS     2      8.1     compile* > verified
+mapping      PASS     2      8.5     compile* > verified
+matrix       FAIL     3      14.1    compile* > compile* > compile*
+money        PASS     1      6.6     verified
+omnibus      PASS     1      8.5     verified
+raising      PASS     1      3.5     verified
+strings      PASS     1      3.8     verified
+
+10/12 landed

@@ -32,3 +32,6 @@ tests/programs/**/*.c
 
 # A repair written by `--repair`: an artefact of a run, not source.
 *.repaired.py
+
+# Scratch output from the report builder.
+tools/report/_build/
