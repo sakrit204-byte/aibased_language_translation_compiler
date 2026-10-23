@@ -35,3 +35,6 @@ tests/programs/**/*.c
 
 # Scratch output from the report builder.
 tools/report/_build/
+
+# Scratch output from the report polish pass.
+tools/report/_polish/
