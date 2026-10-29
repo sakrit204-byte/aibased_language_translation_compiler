@@ -108,7 +108,7 @@ def test_the_keys_become_a_constant_array():
         '    d: dict[str, int] = {"a": 1, "b": 2}\n'
         '    print(d["a"])\n'))
     assert "static const py_str d__keys[2] = {\"a\", \"b\"};" in c_code
-    assert "py_int d__vals[2] = {1, 2};" in c_code
+    assert "py_int d__vals[2] = {1LL, 2LL};" in c_code
 
 
 def test_a_missing_key_is_a_keyerror_at_runtime():

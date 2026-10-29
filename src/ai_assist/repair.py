@@ -552,6 +552,31 @@ Hard rules for your answer:
     This is also the answer to "a list whose length is not known": declare an
     array big enough for the worst case and carry the count beside it. Loop to
     `used`, not to the array's length.
+  - Integers are 64-bit. A constant that does not fit is now a compile
+    error naming the value, so `2 ** 100` is refused rather than printed as
+    0. A number larger than about 9.2e18 is carried as its DIGITS in an
+    array, least significant first, with the arithmetic done a digit at a
+    time and the carry propagated by hand:
+
+        # 2 ** 100, one decimal digit per slot
+        n: list[int, 40] = [0] * 40
+        n[0] = 1
+        used: int = 1
+        i: int = 0
+        while i < 100:
+            carry: int = 0
+            j: int = 0
+            while j < used:
+                doubled: int = n[j] * 2 + carry
+                n[j] = doubled % 10
+                carry = doubled // 10
+                j = j + 1
+            if carry > 0:
+                n[used] = carry
+                used = used + 1
+            i = i + 1
+        # then print n[used - 1] down to n[0]
+
   - Arrays hold numbers only - there is no `list[list[int]]` and no
     `list[str]`. A grid is one flat array with the index worked out:
 

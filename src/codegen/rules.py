@@ -44,7 +44,10 @@ C_RESERVED = {
 
 INT_LIKE = ("int", "bool")
 
-_C_INT32_MAX = 2147483647
+# Python's int is unbounded; C's is not. The subset computes in int64, so
+# these are the limits of what it can represent at all.
+_C_INT64_MIN = -9223372036854775808
+_C_INT64_MAX = 9223372036854775807
 
 
 class CodegenError(Exception):
@@ -112,7 +115,17 @@ def c_string_literal(s: str) -> str:
 
 def c_int_literal(text: str) -> str:
     value = int(text)
-    return f"{value}LL" if abs(value) > _C_INT32_MAX else str(value)
+    if not _C_INT64_MIN <= value <= _C_INT64_MAX:
+        raise CodegenError(
+            f"the integer {value} does not fit in the 64 bits this subset "
+            f"computes in")
+    # Every integer literal carries LL, even a small one. Without it C gives
+    # the literal type `int`, and then computes the whole expression in 32
+    # bits: `1000000 * 1000000 * 1000000` is 10**18, which fits in int64
+    # perfectly well, but wrapped to -1486618624 because each operand was an
+    # int. The suffix is the only thing standing between the subset and a
+    # silently wrong number.
+    return f"{value}LL"
 
 
 def c_float_literal(text: str) -> str:
@@ -274,6 +287,13 @@ class CodegenRules:
     def unaryop(self, node: A.UnaryOp) -> str:
         if node.op == "not":
             return f"(!{self.truth(node.operand)})"
+        if (node.op == "-" and isinstance(node.operand, A.Num)
+                and not node.operand.is_float
+                and int(node.operand.value) == -_C_INT64_MIN):
+            # int64's lower bound has no positive counterpart, so C cannot
+            # write 9223372036854775808LL either. Every C header spells this
+            # one constant the same way, one away from the top.
+            return "(-9223372036854775807LL - 1)"
         return f"({node.op}{self.expr(node.operand)})"
 
     def compare(self, node: A.Compare) -> str:

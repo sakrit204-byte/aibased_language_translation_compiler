@@ -475,10 +475,25 @@ heap allocation, and the generated C has no allocator or ownership model.
 Half-implementing one would be worse than saying no.
 
 Two behavioural limits of the generated code, both documented rather than
-hidden: Python integers are arbitrary precision while `py_int` is 64-bit and
-wraps, and recursion depth is the C stack's rather than
-`sys.getrecursionlimit()`. Everything else matches CPython exactly, and the
-tests prove it by diffing against CPython.
+hidden. Python integers are arbitrary precision while `py_int` is 64-bit, and
+recursion depth is the C stack's rather than `sys.getrecursionlimit()`.
+Everything else matches CPython exactly, and the tests prove it by diffing
+against CPython.
+
+Integer width is split into the half that can be caught and the half that
+cannot. A **constant** too large for 64 bits is refused at compile time with a
+message naming the value, so `print(2 ** 100)` is an error rather than a
+printed `0` — which is what it used to be, and a wrong answer that looks like
+an answer is the worst thing a compiler can do. A value only reached at **run**
+time still wraps: `n ** 100` for a computed `n` is not detected statically, and
+is caught only by the output comparison when repair is involved. Both halves
+have a corpus program: `tests/corpus/bigconst.py` for the constant,
+`tests/corpus/bignum.py` for the runtime case.
+
+The reason the distinction matters is that repair only ever runs on a program
+the compiler **refused**. Turning the constant case into a diagnostic is what
+puts it within reach of repair at all, and the subset can hold the answer: a
+number carried as its digits in an array computes `2 ** 100` exactly.
 
 ## Arrays
 

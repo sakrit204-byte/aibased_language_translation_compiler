@@ -238,7 +238,12 @@ arg_list       = expression { "," expression } [ "," ] ;
 (* ------------------------------------------------------------------ *)
 
 (* Documented behavioural limits of the generated C:                    *)
-(*   - Python ints are arbitrary precision; py_int is 64-bit and wraps. *)
+(*   - Python ints are arbitrary precision; py_int is 64-bit. A       *)
+(*     CONSTANT that does not fit is refused at compile time with a  *)
+(*     message naming the value, so `2 ** 100` is an error and not   *)
+(*     a wrapped 0. A value only reached at RUN time still wraps:    *)
+(*     `n ** 100` for a computed n is not detected. Carry a number   *)
+(*     that large as its digits in an array.                         *)
 (*   - Recursion depth is the C stack's, not sys.getrecursionlimit().   *)
 (*   - Everything else — /, //, %, **, round(), float repr, print       *)
 (*     formatting, zero-division errors — matches CPython exactly, and  *)

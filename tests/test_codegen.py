@@ -18,7 +18,7 @@ def emit(body, signature="def f() -> None:"):
 
 def test_true_division_uses_the_runtime_helper_not_c_division():
     c = emit("x = 7 / 2\n")
-    assert "py_div_int(7, 2)" in c
+    assert "py_div_int(7LL, 2LL)" in c
     assert "7 / 2" not in c
 
 
@@ -50,9 +50,9 @@ def test_declarations_are_hoisted_out_of_branches():
 def test_range_bounds_are_evaluated_once():
     c = emit("for i in range(g(3)):\n    pass\n",
              signature="def g(n: int) -> int:\n    return n\n\ndef f() -> None:")
-    assert "py_int py_stop_1 = g(3);" in c
+    assert "py_int py_stop_1 = g(3LL);" in c
     assert "i < py_stop_1" in c
-    assert c.count("g(3)") == 1
+    assert c.count("g(3LL)") == 1
 
 
 def test_range_with_a_step_guards_against_zero():
@@ -63,13 +63,13 @@ def test_range_with_a_step_guards_against_zero():
 
 def test_augmented_assignment_is_desugared():
     c = emit("x = 1\nx += 2\n")
-    assert "x = (x + 2);" in c
+    assert "x = (x + 2LL);" in c
 
 
 def test_int_arguments_to_printf_are_cast_to_long_long():
     """A bare C `int` read back as `%lld` prints garbage."""
     c = emit("print(1 + 1)\n")
-    assert '(long long)((1 + 1))' in c
+    assert '(long long)((1LL + 1LL))' in c
 
 
 def test_floats_and_bools_use_the_print_helpers():

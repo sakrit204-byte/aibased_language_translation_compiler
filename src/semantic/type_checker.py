@@ -50,6 +50,14 @@ TRUTHY_TYPES = ("bool", "int", "float", "str")
 
 MAX_INFERENCE_ROUNDS = 16
 
+# What the generated C can hold. Python's int has no such limit, so a constant
+# outside this range is refused rather than quietly wrapped.
+_INT64_MIN = -9223372036854775808
+_INT64_MAX = 9223372036854775807
+# Above this exponent a power is rejected on size alone, because computing it
+# first is how you hang the compiler on `2 ** 100000000`.
+_POW_FOLD_LIMIT = 4096
+
 
 class _UnknownType(Exception):
     """Internal: a type could not be determined yet during the inference pre-pass."""
@@ -71,6 +79,9 @@ class TypeChecker:
         # become file-scope arrays: C symbol -> (type, literal).
         self.global_dicts = {}
         self.current_class = None       # set while checking a method body
+        # Nodes whose own int64 range check is already settled by the
+        # enclosing expression. See the UnaryOp branch of _infer.
+        self._range_ok = set()
         self.ai_calls = []          # Call nodes tagged kind="ai", in source order
         self.call_sites = 0         # every call site, for an honest AI-usage rate
         self.env = {}
@@ -1100,10 +1111,82 @@ class TypeChecker:
             raise SemanticError(f"line {line}: undefined variable '{name}'")
         return self.symtab.lookup_var(name, line)
 
+    def _fold_int(self, expr):
+        """The value of an integer constant expression, or None if it is not
+        one (or Python would not give an int back).
+
+        Python's int grows to whatever size it needs; the subset computes in
+        int64. Without this check `print(2 ** 100)` compiles without a word
+        of complaint and prints 0, which is the worst thing a compiler can do:
+        a wrong answer that looks like an answer. Folding the constant
+        expressions turns that into a diagnostic, and a diagnostic is
+        something the repair path can act on.
+        """
+        if isinstance(expr, A.Num):
+            return None if expr.is_float else int(expr.value)
+        if isinstance(expr, A.UnaryOp) and expr.op in ("-", "+"):
+            inner = self._fold_int(expr.operand)
+            if inner is None:
+                return None
+            return -inner if expr.op == "-" else inner
+        if not isinstance(expr, A.BinOp):
+            return None
+        left = self._fold_int(expr.left)
+        right = self._fold_int(expr.right)
+        if left is None or right is None:
+            return None
+        try:
+            if expr.op == "+":
+                return left + right
+            if expr.op == "-":
+                return left - right
+            if expr.op == "*":
+                return left * right
+            if expr.op == "//":
+                return left // right if right else None
+            if expr.op == "%":
+                return left % right if right else None
+            if expr.op == "**":
+                if right < 0:
+                    return None          # Python hands back a float
+                if abs(left) > 1 and right > _POW_FOLD_LIMIT:
+                    # 2 ** 100000000 would be computed in full before it
+                    # could be rejected, so decide by size alone.
+                    self._does_not_fit(expr.line, None)
+                return left ** right
+        except ArithmeticError:
+            return None
+        return None
+
+    def _does_not_fit(self, line, value):
+        """Refuse a constant the generated C could not hold."""
+        if value is None:
+            raise SemanticError(
+                f"line {line}: this power is far larger than a 64-bit "
+                f"integer can hold. The subset computes in int64, so the "
+                f"compiled program would print a wrapped number rather than "
+                f"the value Python prints."
+            )
+        raise SemanticError(
+            f"line {line}: this computes {value}, which does not fit in a "
+            f"64-bit integer. The subset computes in int64, so the compiled "
+            f"program would print a wrapped number rather than this value. "
+            f"Carry a number this large as its digits in an array."
+        )
+
+    def _check_int_range(self, expr, t):
+        """int-typed constant expressions have to fit in int64."""
+        if t != "int" or id(expr) in self._range_ok:
+            return
+        value = self._fold_int(expr)
+        if value is not None and not _INT64_MIN <= value <= _INT64_MAX:
+            self._does_not_fit(expr.line, value)
+
     def _infer(self, expr):
         """Compute and cache the static type of `expr` on the node itself."""
         if isinstance(expr, A.Num):
             t = "float" if expr.is_float else "int"
+            self._check_int_range(expr, t)
         elif isinstance(expr, A.Str):
             t = "str"
         elif isinstance(expr, A.Bool):
@@ -1120,7 +1203,17 @@ class TypeChecker:
             lt = self._infer(expr.left)
             rt = self._infer(expr.right)
             t = self._binop_type(expr.op, lt, rt, expr.right, expr.line)
+            self._check_int_range(expr, t)
         elif isinstance(expr, A.UnaryOp):
+            # `-2 ** 63` is a minus sign applied to 2**63, and
+            # `-9223372036854775808` is a minus sign applied to a literal one
+            # past int64's top. Both are perfectly good programs: the
+            # negation lands exactly on int64's lower bound. So settle the
+            # whole expression before the operand is judged on its own.
+            if expr.op == "-":
+                whole = self._fold_int(expr)
+                if whole is not None and _INT64_MIN <= whole <= _INT64_MAX:
+                    self._range_ok.add(id(expr.operand))
             t = self._unaryop_type(expr)
         elif isinstance(expr, A.Compare):
             t = self._compare_type(expr)

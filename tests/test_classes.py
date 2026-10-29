@@ -159,7 +159,7 @@ def test_a_class_constant_is_inlined():
         "        self.x = 0\n"
         "    def size(self) -> int:\n"
         "        return self.SIZE\n" + MAIN)
-    assert "return 7;" in c_code
+    assert "return 7LL;" in c_code
     assert "SIZE" not in c_code.split("} A;")[0]      # not a struct member
 
 
