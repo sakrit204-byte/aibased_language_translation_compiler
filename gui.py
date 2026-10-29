@@ -741,9 +741,17 @@ class RepairWindow(tk.Toplevel):
         self.verdict_var = tk.StringVar(value="Working…")
 
         self._build_band()
+        # The footer is built BEFORE the panes on purpose. pack() hands each
+        # slave a parcel in packing order, and `self.split` is packed with
+        # expand=True, so if it goes first it takes the whole cavity and a
+        # bottom bar packed afterwards is given nothing: the footer came out
+        # one pixel high and never mapped, which meant the "Continue from the
+        # answer file" button did not exist on screen at all. Reserving the
+        # bar's space first is the fix, and it is why bottom bars are
+        # conventionally packed before the widget that expands.
+        self._build_footer()
         self._build_panes()
         self._build_log()
-        self._build_footer()
         self.apply_theme()
 
         self.left.set_text(source)
@@ -1231,27 +1239,72 @@ class RepairWindow(tk.Toplevel):
     # -- actions --------------------------------------------------------
 
     def await_answer(self, attempt, prompt_path, answer_path):
-        """No model answered, so hand the question over as a file."""
+        """No model answered, so hand the question over as a file.
+
+        The promise made here has to match the stage. Repair compares the
+        bytes; the conversion stage cannot, because there are none. Saying
+        'the four compared runs' in a stage that compares nothing would be
+        the one lie this mode cannot afford, and the CLI says it the same
+        way - see tools/repair_offline.py."""
         self.pending = (attempt, prompt_path, answer_path)
         self._set_verdict("Waiting for an answer file - no model was reached",
                           "warn")
         self.write("\n" + "─" * 70 + "\n", "dim")
         self.write("No model answered, so the question is a file now\n", "head")
-        self.write("  Answering it yourself skips nothing. What you write"
-                   " goes\n"
-                   "  through the safety check, the whole compiler, the"
-                   " shortcut\n"
-                   "  check, the C build and the four compared runs,"
-                   " exactly as\n"
-                   "  a model's answer would - and is refused on the"
-                   " same grounds\n"
-                   "  if it does not hold up.\n\n", "dim")
+        if self.stage == "port":
+            self.write("  Answering it yourself skips nothing. What you write"
+                       " goes\n"
+                       "  through the safety check, the whole compiler, the C"
+                       " build,\n"
+                       "  and starting the program. But nothing compares it"
+                       " with your\n"
+                       "  original, so it will be reported as converted, not"
+                       " verified.\n\n", "dim")
+        else:
+            self.write("  Answering it yourself skips nothing. What you write"
+                       " goes\n"
+                       "  through the safety check, the whole compiler, the"
+                       " shortcut\n"
+                       "  check, the C build and the four compared runs,"
+                       " exactly as\n"
+                       "  a model's answer would - and is refused on the"
+                       " same grounds\n"
+                       "  if it does not hold up.\n\n", "dim")
         self.write("  the question (attempt %d):\n" % attempt, "")
         self.write("    %s\n" % prompt_path, "dim")
         self.write("  write the rewrite into:\n", "")
         self.write("    %s\n" % answer_path, "dim")
-        self.write("\n  then press 'Continue from the answer file'.\n", "")
+        self.write("\n  It is picked up as soon as you save it. The"
+                   " button below\n  does the same thing if you would rather not wait.\n", "")
         self.continue_button.set_enabled(True)
+        self._answer_size = -1
+        self._watch_answer()
+
+    def _watch_answer(self):
+        """Pick the answer up as soon as it is written.
+
+        The CLI needs no button: you write the file and run the command
+        again. This is the same thing, so that the two behave alike - and
+        so that a button being hard to reach cannot strand the run, which
+        is exactly what happened when the footer failed to lay out.
+
+        The size has to be seen twice before it is read, because an editor
+        saving a file can be caught halfway through writing it."""
+        if not self.pending:
+            return
+        answer_path = self.pending[2]
+        try:
+            size = os.path.getsize(answer_path)
+        except OSError:
+            size = -1
+        if size > 0 and size == self._answer_size:
+            self.continue_repair()
+            return
+        self._answer_size = size
+        try:
+            self.after(700, self._watch_answer)
+        except tk.TclError:
+            pass                       # the window was closed
 
     def continue_repair(self):
         if not self.pending:

@@ -113,10 +113,9 @@ def step_2():
 
 def step_3():
     window = app.repair_window
-    log("4. pressing Continue from the answer file")
-    window.continue_repair()
+    log("4. not pressing anything - the file should be picked up on its own")
     wait_for(lambda: id(window.report) != state["before"],
-             "the conversion to be checked", 300, step_4)
+             "the conversion to be picked up and checked", 300, step_4)
 
 
 def step_4():
