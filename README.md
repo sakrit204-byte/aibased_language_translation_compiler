@@ -354,7 +354,7 @@ reported as a difference.
 ### How much it actually lands
 
 "It handles any program" is an opinion. `tests/corpus/` makes it a number:
-twelve ordinary Python programs the compiler refuses, each verified to run
+thirteen ordinary Python programs the compiler refuses, each verified to run
 cleanly and deterministically under CPython, so each is a fair question.
 `python -m tools.repair_bench` asks all of them.
 
@@ -393,6 +393,40 @@ is the signal; a single row is not.
 
 `matrix` and `counting` are open. Both compile and both get the output nearly
 right, which is recorded here rather than rounded off.
+
+The corpus is thirteen programs now: `bigconst.py` joined it when constant
+integer overflow became a diagnostic instead of a wrapped number.
+
+### Repair with no API key at all
+
+Nothing in the repair path cares where a rewrite came from. The safety check,
+the whole compiler, the shortcut check, the C build and the four compared runs
+all happen *after* the answer arrives, and they are what decide the verdict.
+So the answer can come from a file:
+
+```
+python -m tools.repair_offline tests/corpus/bigconst.py
+```
+
+The first run writes the prompt the compiler would have sent and stops. Fill
+in the answer file, run the same command again, and the answer goes through
+every check unchanged. An answer written by hand is held to exactly the same
+standard as one that arrived over the network, because it is the same code —
+`tests/test_repair_offline.py` pins that by feeding the local route an answer
+that prints the number instead of working it out, and watching the shortcut
+check refuse it.
+
+What this mode is and is not evidence of matters. It shows that the subset can
+express a given program and that the verification chain agrees. It says
+nothing about whether a *model* can find that rewrite unaided; that is what
+`tools/repair_bench.py` measures, and it needs an account. The accepted
+answers are kept under `tests/corpus/answers/` so the first claim is
+re-checkable by anyone with no account at all.
+
+An empty account is reported as **blocked**, not as a failed attempt. The
+difference is not cosmetic: scoring an unreachable model as a failure turns a
+billing problem into "0/12 landed", which reads as a verdict on the compiler
+and is not a measurement of anything.
 
 ## Architecture
 

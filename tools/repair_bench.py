@@ -158,18 +158,31 @@ def main(argv=None):
                 f.write(repaired)
 
     passed = sum(1 for r in rows if r[1] == "PASS")
+    # A blocked program was never asked: an unreachable model, or an
+    # original that cannot serve as a reference. Counting those against
+    # the model turns an empty account into "0/12 landed", which is not a
+    # measurement at all.
+    blocked = sum(1 for r in rows if r[1] in ("BLOCKED", "ERROR"))
+    asked = len(rows) - blocked
     print("\n%-12s %-8s %-6s %-7s %s"
           % ("program", "verdict", "tries", "seconds", "stages (* = failed)"))
     for name, verdict, trail, tries, seconds in rows:
         print("%-12s %-8s %-6s %-7s %s"
               % (name, verdict, tries, seconds, trail))
-    print("\n%d/%d landed" % (passed, len(rows)))
+    if blocked:
+        print("\n%d/%d landed of the %d actually asked; %d blocked "
+              "(never asked, so not measured)"
+              % (passed, asked, asked, blocked))
+    else:
+        print("\n%d/%d landed" % (passed, len(rows)))
 
     with io.open(os.path.join(out_dir, "summary.json"), "w",
                  encoding="utf-8") as f:
         json.dump({"attempts": attempts, "passed": passed, "total": len(rows),
-                   "rows": rows}, f, indent=2)
-    return 0 if passed == len(rows) else 1
+                   "blocked": blocked, "asked": asked, "rows": rows},
+                  f, indent=2)
+    # Nothing asked is not success, however empty the failure column looks.
+    return 0 if asked and passed == asked else 1
 
 
 if __name__ == "__main__":

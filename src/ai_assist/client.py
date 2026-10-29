@@ -155,13 +155,33 @@ class RateLimited(AIClientError):
     """The upstream free pool is busy. Retrying, or paying, may work."""
 
 
+class OutOfCredit(AIClientError):
+    """There is no credit, so no question was ever put to a model.
+
+    Its own class because the difference matters to every caller: this is
+    not a model that answered badly, or a rewrite that failed a check. It
+    is an account with an empty balance, and reporting it as a failed
+    attempt makes a billing problem look like a limitation of the
+    compiler or of the model.
+    """
+
+
 def _http_error(code, model, body):
     if code == 429:
         return RateLimited(f"{model} is rate-limited upstream (HTTP 429).")
     if code == 401:
         return AIClientError("OpenRouter rejected the API key (HTTP 401).")
     if code == 402:
-        return AIClientError("OpenRouter reports insufficient credit (HTTP 402).")
+        # Worth spelling out, because the key's own /api/v1/key endpoint
+        # reports a `limit_remaining` that looks like money and is not: it
+        # is headroom under the cap set on the key. The balance that
+        # decides this is /api/v1/credits.
+        return OutOfCredit(
+            "OpenRouter reports insufficient credit (HTTP 402). The "
+            "account balance is what matters here, not the key's spending "
+            "cap: check it at /api/v1/credits and top up at "
+            "openrouter.ai/credits. Nothing was asked of the model, so "
+            "this says nothing about the program.")
     return AIClientError(f"OpenRouter HTTP {code} for {model}: {body}")
 
 

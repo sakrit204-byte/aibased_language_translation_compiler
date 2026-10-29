@@ -685,7 +685,7 @@ def _extract_python(raw):
 # ------------------------------------------------------------------- entry
 
 def repair(source, error="", model=None, log_path=None, use_ai=False,
-           attempts=MAX_ATTEMPTS, progress=None):
+           attempts=MAX_ATTEMPTS, progress=None, ask=None):
     """Try to rewrite `source` into the subset. Returns (repaired, report).
 
     `repaired` is the accepted program, or None when nothing was accepted —
@@ -693,12 +693,28 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
 
     `progress`, if given, is called with (stage, text, ok) as each step
     finishes, so a caller can show the work as it happens rather than after.
+
+    `ask` is where the rewrite comes from: a callable taking (prompt, attempt)
+    and returning Python source. It defaults to an HTTP call to OpenRouter,
+    but nothing in this function cares which end of the wire the answer came
+    from — see tools/repair_offline.py, which puts the prompt in a file and
+    reads the answer back out of one.
+
+    The reason that seam exists where it does is that *none* of the work this
+    function is actually for happens inside `ask`. The safety check, the whole
+    compiler, the shortcut check, the C build and the four compared runs all
+    happen after it returns, and they are what decide the verdict. An answer
+    written by hand is held to exactly the same standard as one that arrived
+    over the network, because it goes through exactly the same code.
     """
     from ..driver import CompileError, compile_source_detailed
 
     report = {
         "accepted": False,
-        "model": model or client.DEFAULT_MODEL,
+        # What answered. Naming a model that was never contacted would make
+        # the log say the opposite of what happened.
+        "model": (getattr(ask, "label", "a local answer") if ask is not None
+                  else (model or client.DEFAULT_MODEL)),
         "error": error,
         "source": source,
         "repaired": None,
@@ -770,16 +786,32 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
             previous = None
         record = {"attempt": attempt}
         trace = []
-        say("model", "attempt %d: asking %s for a rewrite…"
-            % (attempt, report["model"]))
+        if ask is None:
+            say("model", "attempt %d: asking %s for a rewrite…"
+                % (attempt, report["model"]))
+        else:
+            say("model", "attempt %d: taking the rewrite from %s"
+                % (attempt, getattr(ask, "label", "a local answer")))
         started = time.time()
+        prompt = _prompt(source, error, survey, reference, history)
         try:
-            raw = client.query(_prompt(source, error, survey, reference, history),
-                               model=model, max_tokens=REPAIR_TOKEN_BUDGET,
-                               timeout=REPAIR_TIMEOUT, trace=trace)
+            if ask is not None:
+                raw = ask(prompt, attempt)
+            else:
+                raw = client.query(prompt, model=model,
+                                   max_tokens=REPAIR_TOKEN_BUDGET,
+                                   timeout=REPAIR_TIMEOUT, trace=trace)
         except client.AIClientError as e:
-            record.update(stage="model", ok=False, reason=str(e), providers=trace)
+            # The model was never reached, so nothing was rejected and nothing
+            # was learned about the program. That is a different outcome from
+            # an answer that failed a check, and it is recorded as one: an
+            # unreachable attempt is blocked, not failed. Scoring it as a
+            # failure would read as "repair cannot do this" when the truth is
+            # "repair was never asked".
+            record.update(stage="model", ok=False, reason=str(e),
+                          providers=trace, unreachable=True)
             report["attempts"].append(record)
+            report["blocked"] = str(e)
             say("model", str(e), False)
             break
         record["providers"] = trace
@@ -950,11 +982,20 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
         return candidate, report
 
     last = report["attempts"][-1] if report["attempts"] else {}
-    report["reason"] = (
-        "nothing was accepted after %d attempt(s); the last one failed at the "
-        "%s stage: %s" % (len(report["attempts"]) or attempts,
-                          last.get("stage", "model"),
-                          last.get("reason", "no candidate produced")))
+    if last.get("unreachable"):
+        # Not "could not do it" - "was never asked". The attempt count is
+        # left out on purpose: quoting "after 1 attempt" out of five invites
+        # the reader to wonder what happened to the other four, when the
+        # answer is that there was no point making them.
+        report["reason"] = (
+            "no rewrite was ever produced, because the model could not be "
+            "reached: %s" % last.get("reason", "the request did not complete"))
+    else:
+        report["reason"] = (
+            "nothing was accepted after %d attempt(s); the last one failed at "
+            "the %s stage: %s" % (len(report["attempts"]) or attempts,
+                                  last.get("stage", "model"),
+                                  last.get("reason", "no candidate produced")))
     _log(log_path, report)
     return None, report
 

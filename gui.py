@@ -1019,6 +1019,11 @@ class RepairWindow(tk.Toplevel):
             head = f"  attempt {attempt.get('attempt')} — {stage}: "
             if ok:
                 self.write(head + "accepted\n", "ok")
+            elif attempt.get("unreachable"):
+                # Nothing was rejected: the question never arrived.
+                # Calling this "rejected" makes an empty account read
+                # as a failure of the model, or of the compiler.
+                self.write(head + "never asked\n", "warn")
             else:
                 self.write(head + "rejected\n", "err")
                 reason = str(attempt.get("reason", "")).strip()
