@@ -1151,8 +1151,15 @@ class RepairWindow(tk.Toplevel):
         self.left.title_label.configure(
             text=f"Original — did not compile  ({removed} line(s) replaced)")
         if self.repaired:
+            # The conversion stage shares this view but proves something far
+            # weaker, so the header has to say which one produced the pane.
+            # "Repair - verified" over a conversion would contradict the
+            # verdict printed two inches below it, and the overstatement is
+            # the single thing this stage is built to avoid.
+            word = ("Converted - NOT verified" if self.stage == "port"
+                    else "Repair — verified")
             self.right.title_label.configure(
-                text=f"Repair — verified  ({added} line(s) in their place)")
+                text=f"{word}  ({added} line(s) in their place)")
         self.write(f"\n{removed} line(s) replaced by {added}; the rest is "
                    f"untouched and is shown on the same row.\n", "dim")
 

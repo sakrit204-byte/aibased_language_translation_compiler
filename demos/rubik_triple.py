@@ -300,10 +300,15 @@ def draw_core(ox: float, r: float, g: float, b: float) -> None:
 
 def draw_cube(state: list[int], base: int, ox: float, chosen: int,
               solved: int) -> None:
-    if solved != 0:
-        draw_core(ox, 0.16, 0.45, 0.24)
+    # Two things to show with one colour, so they are kept independent:
+    # green means solved, bright means selected. Testing solved first hid the
+    # selection whenever the cube was solved, which is every cube at startup.
+    if solved != 0 and chosen != 0:
+        draw_core(ox, 0.35, 0.85, 0.45)
+    elif solved != 0:
+        draw_core(ox, 0.11, 0.33, 0.17)
     elif chosen != 0:
-        draw_core(ox, 0.42, 0.44, 0.50)
+        draw_core(ox, 0.55, 0.57, 0.63)
     else:
         draw_core(ox, 0.07, 0.07, 0.08)
 

@@ -38,3 +38,11 @@ tools/report/_build/
 
 # Scratch output from the report polish pass.
 tools/report/_polish/
+
+# Scratch output from the slide deck build.
+tools/ppt/node_modules/
+tools/ppt/package-lock.json
+tools/ppt/package.json
+presentation/slide-*.jpg
+presentation/screenshots/_build/
+presentation/screenshots/_shot.ps1
