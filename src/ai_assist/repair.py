@@ -171,6 +171,41 @@ def run_python(source, timeout=REFERENCE_TIMEOUT):
                 pass
 
 
+#: Modules that put a window on the screen. A program importing one of these
+#: is not a program whose behaviour is bytes on stdout, so there is nothing
+#: for the output comparison to hold a rewrite to - and running it to find
+#: that out would open the window, which is exactly what nobody asked for.
+WINDOWING_MODULES = (
+    "tkinter", "turtle", "pygame", "ursina", "kivy", "arcade", "panda3d",
+    "PyQt5", "PyQt6", "PySide2", "PySide6", "wx", "pyglet", "OpenGL",
+)
+
+
+def opens_a_window(source):
+    """The windowing module this program imports, or None.
+
+    Read off the import statements rather than searched for as text, so a
+    mention in a comment or a string does not count.
+    """
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            root = name.split(".")[0]
+            if root in WINDOWING_MODULES:
+                return root
+    return None
+
+
 def reference_run(source, timeout=REFERENCE_TIMEOUT):
     """What the original program does — established, not assumed.
 
@@ -184,6 +219,21 @@ def reference_run(source, timeout=REFERENCE_TIMEOUT):
     says nothing about the next. Catching that here costs one extra run and
     removes the one case where a green tick would have been meaningless.
     """
+    toolkit = opens_a_window(source)
+    if toolkit:
+        # Refused before anything is launched. The old behaviour was to run it
+        # and wait for the timeout, which meant the program's own window
+        # appearing on screen twice before being told it could not be helped.
+        raise RepairError(
+            "this program imports %s, so it puts a window on the screen rather "
+            "than text on its output. The comparison that accepts a repair is "
+            "'the bytes are identical', and a window has no bytes - a rewrite "
+            "that printed nothing would be accepted while proving nothing, and "
+            "one that printed anything would be refused for not matching. So "
+            "there is no verdict worth giving here, and the original is not run "
+            "at all: finding this out by launching it would just open the "
+            "window." % toolkit)
+
     try:
         code, out, err = run_python(source, timeout)
     except subprocess.TimeoutExpired:

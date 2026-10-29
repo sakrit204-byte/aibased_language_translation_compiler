@@ -258,6 +258,24 @@ The one case where the argument does not hold is a program that prints nothing:
 matching "no output" is not evidence. The report marks that `vacuous` and says
 so rather than showing a tick.
 
+### A program whose output is a window
+
+A program that imports a windowing toolkit is refused before it is run, and
+the refusal says why rather than just saying no. Two things were wrong with
+running it first and deciding afterwards. The program's own window appears on
+screen, twice, because the reference run runs it twice to check it agrees with
+itself - nobody pressing Translate asked for their tkinter app to start. And
+a windowed program has no bytes on stdout, which is the whole of what accepts
+a repair: a rewrite that printed nothing was accepted while proving nothing,
+and a rewrite that did the work and showed it was refused for not matching an
+empty target. A seven-line program that summed 0 to 8 and printed nothing was
+accepted as a repair of a 360-line Rubik's cube before this check existed.
+
+Translating a program runs the C it produced, not the Python it came from. The
+compiled program is the point; running the Python proves nothing about the
+translation, and "Run Python" is still a button for when you want it. Set
+`auto_run_c` to false in settings to turn the auto-run off.
+
 ### The hole in "the output is the whole spec"
 
 If output is all that is checked, then for a program with **no input** the spec

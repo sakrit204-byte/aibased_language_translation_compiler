@@ -1300,6 +1300,10 @@ class TranslationCompilerApp:
             saved_model = ai_client.DEFAULT_MODEL
         self.model_var = tk.StringVar(value=saved_model)
         self.ai_var = tk.BooleanVar(value=False)
+        # A successful translation runs the C it produced. Remembered in
+        # settings so it can be turned off and stay off.
+        self.auto_run_c = tk.BooleanVar(
+            value=bool(self.settings.get("auto_run_c", True)))
         self.status_var = tk.StringVar(value="Ready")
         self.position_var = tk.StringVar(value="Ln 1, Col 1")
 
@@ -2194,6 +2198,13 @@ class TranslationCompilerApp:
                         tone)
         self._save_history(source, c_code, stats)
 
+        # Run the C, not the Python. The point of the exercise is the compiled
+        # program, so that is the one that gets launched; the Python is there
+        # as the thing being translated, and running it proves nothing about
+        # the translation. "Run Python" is still a button for when you want it.
+        if self.c_compiler and self.auto_run_c.get():
+            self.root.after(150, self.run_c)
+
     def _on_failure(self, message, results):
         self._finish()
         self.pipeline = results
@@ -2798,7 +2809,9 @@ class TranslationCompilerApp:
         try:
             os.makedirs(HISTORY_DIR, exist_ok=True)
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump({"theme": self.theme_name, "model": self.model_var.get()},
+                json.dump({"theme": self.theme_name,
+                           "model": self.model_var.get(),
+                           "auto_run_c": bool(self.auto_run_c.get())},
                           f, indent=2)
         except OSError:
             pass
