@@ -808,8 +808,13 @@ def repair(source, error="", model=None, log_path=None, use_ai=False,
             # unreachable attempt is blocked, not failed. Scoring it as a
             # failure would read as "repair cannot do this" when the truth is
             # "repair was never asked".
+            # The prompt is kept on the record. It is the one thing a
+            # caller needs to carry on without the network: hand it to
+            # somebody, take the answer back, and the rest of the
+            # pipeline runs exactly as it would have.
             record.update(stage="model", ok=False, reason=str(e),
-                          providers=trace, unreachable=True)
+                          providers=trace, unreachable=True,
+                          prompt=prompt)
             report["attempts"].append(record)
             report["blocked"] = str(e)
             say("model", str(e), False)

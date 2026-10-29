@@ -726,6 +726,7 @@ class RepairWindow(tk.Toplevel):
         self.error = error or ""
         self.repaired = None
         self.report = None
+        self.pending = None            # a NeedAnswer, while one is open
         self._syncing = False
         self._running = False
         self._buttons = []
@@ -844,6 +845,15 @@ class RepairWindow(tk.Toplevel):
                                        padx=14, pady=6)
         self.run_button.pack(side="left", padx=4, pady=10)
         self.run_button.set_enabled(False)
+
+        # When no model can be reached, the question becomes a file and
+        # the answer is read back from one. The repair itself is
+        # unchanged: what comes back goes through every check.
+        self.continue_button = self._button(
+            "Continue from the answer file", self.continue_repair,
+            padx=14, pady=6)
+        self.continue_button.pack(side="left", padx=4, pady=10)
+        self.continue_button.set_enabled(False)
 
         self.close_button = self._button("Close", self.close)
         self.close_button.pack(side="right", padx=(4, 16), pady=10)
@@ -1166,6 +1176,38 @@ class RepairWindow(tk.Toplevel):
                        + "\n", "err")
 
     # -- actions --------------------------------------------------------
+
+    def await_answer(self, attempt, prompt_path, answer_path):
+        """No model answered, so hand the question over as a file."""
+        self.pending = (attempt, prompt_path, answer_path)
+        self._set_verdict("Waiting for an answer file - no model was reached",
+                          "warn")
+        self.write("\n" + "─" * 70 + "\n", "dim")
+        self.write("No model answered, so the question is a file now\n", "head")
+        self.write("  Answering it yourself skips nothing. What you write"
+                   " goes\n"
+                   "  through the safety check, the whole compiler, the"
+                   " shortcut\n"
+                   "  check, the C build and the four compared runs,"
+                   " exactly as\n"
+                   "  a model's answer would - and is refused on the"
+                   " same grounds\n"
+                   "  if it does not hold up.\n\n", "dim")
+        self.write("  the question (attempt %d):\n" % attempt, "")
+        self.write("    %s\n" % prompt_path, "dim")
+        self.write("  write the rewrite into:\n", "")
+        self.write("    %s\n" % answer_path, "dim")
+        self.write("\n  then press 'Continue from the answer file'.\n", "")
+        self.continue_button.set_enabled(True)
+
+    def continue_repair(self):
+        if not self.pending:
+            return
+        self.continue_button.set_enabled(False)
+        self.pending = None
+        self.write("\n  reading the answer file...\n", "dim")
+        self._set_verdict("Working - checking the answer you wrote", "warn")
+        self.app.resume_repair(self)
 
     def apply_repair(self):
         if not self.repaired:
@@ -1812,8 +1854,54 @@ class TranslationCompilerApp:
                          args=(source, self.last_error, self.model_var.get(), window),
                          daemon=True).start()
 
-    def _repair_worker(self, source, error, model, window):
+    def buffer_folder(self, source):
+        """Where the question and the answer live, for this exact program.
+
+        The name carries a digest of the source, not just the file name. The
+        file name is whatever the editor last had open, which is not the same
+        thing as the program in the pane - and if two programs shared a
+        folder, a stale answer written for one would be picked up and judged
+        against the other's output. It would be refused, so nothing unsound
+        gets through, but the refusal would make no sense to read.
+
+        Keying on the source instead means an answer stays valid for the
+        program it was written for, across sessions, and is never offered for
+        anything else. Edit the program and you get a new folder, which is
+        correct: the old answer was for the old program.
+        """
+        import hashlib
+
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:8]
+        folder = os.path.join(REPORTS_DIR, "repair_buffer",
+                              "%s-%s" % (self._base_name(), digest))
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def resume_repair(self, window):
+        """Run the repair again, reading the answer out of the buffer.
+
+        It starts from the beginning rather than resuming mid-flight, which
+        costs a second and keeps this honest: the reference run, the safety
+        check, the compiler and the comparisons all happen again, over the
+        answer that is on disk now.
+        """
+        from tools.repair_offline import make_ask
+
+        self.busy = True
+        self.translate_button.set_enabled(False)
+        self.repair_button.set_enabled(False)
+        self.set_status("Checking the answer you wrote, the same way a model's "
+                        "would be checked...")
+        threading.Thread(
+            target=self._repair_worker,
+            args=(window.source, window.error, self.model_var.get(), window),
+            kwargs={"ask": make_ask(self.buffer_folder(window.source),
+                                    verbose=False)},
+            daemon=True).start()
+
+    def _repair_worker(self, source, error, model, window, ask=None):
         from src.ai_assist.repair import repair
+        from tools.repair_offline import NeedAnswer
 
         log_path = os.path.join(REPORTS_DIR, "ai_invocation_log.md")
 
@@ -1824,7 +1912,12 @@ class TranslationCompilerApp:
             repaired, report = repair(source, error=error, model=model,
                                       log_path=log_path,
                                       use_ai=bool(self.ai_var.get()),
-                                      progress=progress)
+                                      progress=progress, ask=ask)
+        except NeedAnswer as need:
+            # The buffer has no answer for this attempt yet. Not a failure:
+            # the question is on disk and the window says where.
+            self.root.after(0, lambda: self._on_answer_wanted(window, need))
+            return
         except Exception as error_obj:
             message = f"{type(error_obj).__name__}: {error_obj}"
             self.root.after(0, lambda: self._on_repair_failed(window, message))
@@ -1851,12 +1944,57 @@ class TranslationCompilerApp:
         except tk.TclError:
             pass
 
+    def _on_answer_wanted(self, window, need):
+        """The buffer is waiting for an answer: say so and stop."""
+        self._finish_repair()
+        self.set_status("No model was reached - the question is in a file, "
+                        "waiting for an answer", "warn")
+        try:
+            window.await_answer(need.attempt, need.prompt_path,
+                                need.answer_path)
+        except tk.TclError:
+            pass
+
+    def _hand_the_question_over(self, window, report):
+        """Write the prompt into the buffer so the repair can carry on by hand.
+
+        Only reached when a model could not be answered at all. The prompt is
+        the one thing needed to continue without the network, and repair keeps
+        it on the attempt record for exactly this.
+        """
+        attempts = report.get("attempts") or []
+        last = attempts[-1] if attempts else {}
+        prompt = last.get("prompt")
+        if not prompt:
+            return False
+        folder = self.buffer_folder(report.get("source") or window.source)
+        attempt = last.get("attempt", 1)
+        prompt_path = os.path.join(folder, "prompt-%d.md" % attempt)
+        answer_path = os.path.join(folder, "answer-%d.py" % attempt)
+        try:
+            with open(prompt_path, "w", encoding="utf-8",
+                      newline="\n") as f:
+                f.write(prompt)
+        except OSError:
+            return False
+        try:
+            window.await_answer(attempt, prompt_path, answer_path)
+        except tk.TclError:
+            return False
+        self.set_status("No model was reached - the question is in a file, "
+                        "waiting for an answer", "warn")
+        return True
+
     def _on_repair_done(self, window, repaired, report):
         self._finish_repair()
         try:
             window.show_result(repaired, report)
         except tk.TclError:
             pass
+        attempts = report.get("attempts") or []
+        if (not repaired and attempts and attempts[-1].get("unreachable")
+                and self._hand_the_question_over(window, report)):
+            return
         if report.get("blocked"):
             self.set_status("Not repairable: " + report["blocked"].splitlines()[0][:90],
                             "err")

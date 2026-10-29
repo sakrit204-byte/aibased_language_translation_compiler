@@ -423,6 +423,18 @@ nothing about whether a *model* can find that rewrite unaided; that is what
 answers are kept under `tests/corpus/answers/` so the first claim is
 re-checkable by anyone with no account at all.
 
+The IDE does the same thing without being asked. Press Repair with no credit
+and, instead of stopping at the error, it writes the question into
+`reports/repair_buffer/<name>-<digest>/prompt-1.md` and enables **Continue
+from the answer file**. Write the rewrite into `answer-1.py` beside it, press
+that button, and the answer goes through every check. The folder is keyed on a
+digest of the source rather than the file name, because the file name is
+whatever the editor last had open: without the digest, an answer written for
+one program could be offered for another, and the refusal that followed would
+make no sense to read. `python -m tools.check_buffer_flow` drives the real
+window through that whole path and is the only test of it, because it needs a
+desktop.
+
 An empty account is reported as **blocked**, not as a failed attempt. The
 difference is not cosmetic: scoring an unreachable model as a failure turns a
 billing problem into "0/12 landed", which reads as a verdict on the compiler
