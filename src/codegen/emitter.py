@@ -463,9 +463,26 @@ class Emitter:
                 new_value.right = _Rendered(replacements[id(children[1])],
                                             self.rules.type_of(children[1]))
             elif isinstance(value, (A.Call, A.MethodCall)):
+                # A plain name is kept as itself rather than replaced by the
+                # temporary holding its value. Two reasons, and the first is
+                # a bug this fixes: an array or object argument has to be a
+                # name, because the call also needs the array's length and an
+                # object's address, and neither can be recovered from a
+                # rendered expression. Shadowing every argument meant that
+                # `draw(grid, f(i), g(j))` - a name beside two calls, so the
+                # arguments get ordered - was refused with "an array argument
+                # must be a plain name" about an argument that WAS a plain
+                # name. The second reason is that there is nothing to gain:
+                # hoisting exists to pin down Python's left-to-right
+                # evaluation, and reading a local cannot be affected by the
+                # calls beside it. A callee has no way to assign to its
+                # caller's variable here, and an array is passed as a pointer
+                # whose value no callee can change.
                 new_value.args = [
-                    _Rendered(replacements[id(c)], self.rules.type_of(c))
-                    for c in children]
+                    child if isinstance(child, A.Name)
+                    else _Rendered(replacements[id(child)],
+                                   self.rules.type_of(child))
+                    for child in children]
             if hasattr(shadow, "value"):
                 shadow.value = new_value
             else:
