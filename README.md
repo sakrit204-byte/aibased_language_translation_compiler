@@ -276,6 +276,53 @@ compiled program is the point; running the Python proves nothing about the
 translation, and "Run Python" is still a button for when you want it. Set
 `auto_run_c` to false in settings to turn the auto-run off.
 
+### The last stage: convert what cannot be verified
+
+Every stage above refuses to produce a result it cannot prove. That is the
+right default and it is why the rest of this document can make the claims it
+makes. But for a program whose behaviour is a window the default leaves
+nothing at all: the program stays untranslated, and the one thing the AI could
+usefully have done goes undone.
+
+So there is a final stage, reached only when verifying was **impossible** -
+never when it was possible and the answers were merely wrong, because an
+unverified result offered in place of a failed proof would undercut
+everything else here.
+
+```
+python -m src.driver thing.py --port
+python -m tools.repair_offline thing.py --port     # no API key needed
+```
+
+It asks for a conversion into the subset, drawing through `gfx`, and then
+establishes everything that can be established about the answer: that it is
+valid Python declaring `main()`, that the whole deterministic compiler accepts
+it, that the C it produced builds and links, and that the binary starts and
+stays up. Then it stops, and says so:
+
+```
+verdict: CONVERTED, NOT VERIFIED
+  established    : it is valid Python and declares main()
+  established    : the whole compiler accepts it, with no stage special-cased
+  established    : the C it produced builds and links (154892 bytes of executable)
+  established    : it started and was still running after 3s, so it was stopped
+  NOT established: that it behaves like the original; nothing compared them
+```
+
+The word "verified" never appears in a port report on its own, and
+`tests/test_port.py` asserts it. This is the single result in the project that
+cannot be proved, so it must not be the one that looks strongest. In the IDE
+the pipeline falls through to it by itself and the window is headed
+**Converted - NOT verified**.
+
+`tests/programs/ported/` holds the worked example: a pygame spinning square,
+and the conversion that compiles to a 154KB executable. It was produced with
+no API key, through the answer-file buffer, and is re-checked offline by the
+test suite. What the pair proves is that the subset can express the program
+and the compiler can build it. What it does not prove is that the two look the
+same on screen, and the stage is built so that nobody can mistake one for the
+other.
+
 ### The hole in "the output is the whole spec"
 
 If output is all that is checked, then for a program with **no input** the spec

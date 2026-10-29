@@ -101,6 +101,28 @@ def make_ask(folder, verbose=True):
 def report_lines(report):
     """The verdict and the evidence behind it, as the IDE would show it."""
     lines = []
+    if "ported" in report:
+        # The conversion stage. Deliberately a different word: nothing here
+        # was verified against the original, and "accepted" would imply it.
+        verdict = "CONVERTED, NOT VERIFIED" if report["ported"] else "NOT CONVERTED"
+        if report.get("blocked"):
+            verdict = "BLOCKED"
+        lines = ["verdict: %s" % verdict]
+        if report.get("reason"):
+            lines.append("reason : %s" % report["reason"])
+        for item in report.get("proof", []):
+            lines.append("  established    : %s" % item)
+        if report.get("ported"):
+            lines.append("  NOT established: that it behaves like the original; "
+                         "nothing compared them")
+        for attempt in report.get("attempts", []):
+            mark = "+" if attempt.get("ok") else "!"
+            lines.append("  %s attempt %s at the %s stage"
+                         % (mark, attempt.get("attempt"), attempt.get("stage")))
+            for line in str(attempt.get("reason", "")).strip().splitlines()[:6]:
+                lines.append("      %s" % line)
+        return lines
+
     verdict = "ACCEPTED" if report.get("accepted") else "NOT ACCEPTED"
     if report.get("accepted") and report.get("vacuous"):
         verdict = "ACCEPTED BUT VACUOUS"
@@ -137,6 +159,10 @@ def main(argv=None):
     ap.add_argument("--use-ai", action="store_true",
                     help="allow the AI gate while recompiling a rewrite; off "
                          "by default, because the gate needs the network too")
+    ap.add_argument("--port", action="store_true",
+                    help="run the last-resort conversion stage instead of "
+                         "repair, for a program whose behaviour is a window "
+                         "and so cannot be verified by its output at all")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -166,12 +192,18 @@ def main(argv=None):
             first = text.splitlines()[0] if text else ""
             print(_plain("  %s %-10s %s" % (mark, stage, first)))
 
+    from src.ai_assist.port import port
     from src.ai_assist.repair import repair
 
     try:
-        repaired, report = repair(source, error, use_ai=args.use_ai,
-                                  attempts=args.attempts, progress=progress,
-                                  ask=make_ask(folder, not args.quiet))
+        if args.port:
+            repaired, report = port(source, error, use_ai=args.use_ai,
+                                    attempts=args.attempts, progress=progress,
+                                    ask=make_ask(folder, not args.quiet))
+        else:
+            repaired, report = repair(source, error, use_ai=args.use_ai,
+                                      attempts=args.attempts, progress=progress,
+                                      ask=make_ask(folder, not args.quiet))
     except NeedAnswer as need:
         print("\nthe prompt for attempt %d is written:" % need.attempt)
         print("  %s" % need.prompt_path)
@@ -180,10 +212,19 @@ def main(argv=None):
               % (size, io.open(need.prompt_path, encoding="utf-8").read().count("\n")))
         print("\nwrite the rewrite into:")
         print("  %s" % need.answer_path)
-        print("\nthen run the same command again. Nothing is skipped when you "
-              "do:\nthe answer goes through the safety check, the whole "
-              "compiler, the\nshortcut check, the C build and the four "
-              "compared runs.")
+        print("\nthen run the same command again. Nothing is skipped when you do:")
+        if args.port:
+            # No comparison is promised here, because there is none to
+            # make. Saying otherwise would be the one lie this mode
+            # cannot afford.
+            print("the answer goes through the safety check, the whole "
+                  "compiler,\nthe C build, and starting the program. But nothing "
+                  "compares it\nwith your original, so it will be reported as "
+                  "converted, not verified.")
+        else:
+            print("the answer goes through the safety check, the whole "
+                  "compiler, the\nshortcut check, the C build and the four "
+                  "compared runs.")
         return 2
 
     print()
@@ -199,7 +240,12 @@ def main(argv=None):
                  encoding="utf-8") as f:
         json.dump(slim, f, indent=2, ensure_ascii=False, default=str)
 
-    if repaired:
+    if repaired and args.port:
+        out = os.path.join(folder, "converted.py")
+        with io.open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(repaired)
+        print("\nwrote %s" % out)
+    elif repaired:
         accepted = os.path.join(folder, "accepted.py")
         with io.open(accepted, "w", encoding="utf-8", newline="\n") as f:
             f.write(repaired)

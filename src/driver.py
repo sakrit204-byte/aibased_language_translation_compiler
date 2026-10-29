@@ -258,6 +258,13 @@ def main(argv=None):
                          "program into the subset, and keep its answer only if "
                          "the compiled result prints exactly what the original "
                          "prints under CPython")
+    ap.add_argument("--port", action="store_true",
+                    help="last resort: when a program cannot be verified by "
+                         "its output at all, because its behaviour is a "
+                         "window, convert it into the subset anyway and "
+                         "report what was established - that it compiles, "
+                         "builds and runs. Never reported as verified, "
+                         "because nothing compares it with the original.")
     ap.add_argument("--repair-out",
                     help="where to write an accepted repair "
                          "(default: <source>.repaired.py)")
@@ -291,9 +298,18 @@ def main(argv=None):
         )
     except CompileError as e:
         print(f"{args.source}: {e}", file=sys.stderr)
-        if not args.repair:
+        if not args.repair and not args.port:
             return 1
-        source, c_code, stats, results = _repair(args, source, str(e), use_ai)
+        # `source` is about to become the rewrite, or None, so the original
+        # has to be held somewhere before either call can read it.
+        original = source
+        source, c_code, stats, results = (None, None, None, None)
+        if args.repair:
+            source, c_code, stats, results = _repair(
+                args, original, str(e), use_ai)
+        if source is None and args.port:
+            source, c_code, stats, results = _port(
+                args, original, str(e), use_ai)
         if source is None:
             return 1
 
@@ -356,6 +372,51 @@ def _plain(text):
     except (UnicodeEncodeError, LookupError):
         text = text.encode("ascii", "replace").decode("ascii")
     return text
+
+
+def _port(args, source, error, use_ai=False):
+    """The last stage: convert a program that cannot be verified at all.
+
+    Only reached when repair could not run or did not land. It returns the
+    same four values as _repair so the caller does not care which produced
+    them - but the verdict it prints is deliberately a different word, and
+    the file it writes is named .ported.py rather than .repaired.py, because
+    "repaired" would imply a comparison that never happened.
+    """
+    from .ai_assist.port import port as port_source
+
+    def progress(stage, text, ok):
+        mark = {True: "  ok ", False: "  no ", None: "  .. "}[ok]
+        print(f"{mark}{stage}: {_plain(text)}", file=sys.stderr)
+
+    print("\nnothing could be verified by output; converting instead\n",
+          file=sys.stderr)
+    converted, report = port_source(
+        source, error=error, model=args.model, use_ai=use_ai,
+        attempts=args.repair_attempts or repair_module.MAX_ATTEMPTS,
+        progress=progress,
+    )
+    if not converted:
+        print(_plain(f"\nno conversion produced: {report['reason']}"),
+              file=sys.stderr)
+        return None, None, None, None
+
+    out = os.path.splitext(args.source)[0] + ".ported.py"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(converted)
+
+    print("\n--- what this does and does not establish ---",
+          file=sys.stderr)
+    for line in report["proof"]:
+        print(_plain("  established: %s" % line), file=sys.stderr)
+    print(_plain("  NOT established: that it behaves like your program. "
+                 "Nothing compared them."), file=sys.stderr)
+    print(_plain(f"\nCONVERTED, NOT VERIFIED -> {out}"),
+          file=sys.stderr)
+    return converted, report["c_code"], {"total_call_sites": 0,
+                                         "ai_calls_used": 0,
+                                         "ai_queries": 0}, {
+        "link": report["link"] or {"sources": [], "flags": []}}
 
 
 def _repair(args, source, error, use_ai=False):

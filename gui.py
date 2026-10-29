@@ -727,6 +727,7 @@ class RepairWindow(tk.Toplevel):
         self.repaired = None
         self.report = None
         self.pending = None            # a NeedAnswer, while one is open
+        self.stage = "repair"          # or "port", the last resort
         self._syncing = False
         self._running = False
         self._buttons = []
@@ -962,6 +963,58 @@ class RepairWindow(tk.Toplevel):
         self.write(f"{mark}{label}: {text}\n", tone)
         if ok is None:
             self._set_verdict(f"Working — {label}: {text}", "warn")
+
+    def show_port_result(self, converted, report):
+        """A conversion, shown as a conversion.
+
+        The wording here is load-bearing. Everything else this window reports
+        has been checked against the original's output; this has not, because
+        there was no output to check against. If it said "verified" anywhere,
+        the one result in the program that cannot be proved would be the one
+        that looked strongest.
+        """
+        self.repaired = converted
+        self.report = report
+        self.stage = "port"
+
+        if report.get("blocked"):
+            self._set_verdict("Could not convert it either", "err")
+            self.write("\n" + "─" * 70 + "\n", "dim")
+            self.write("Conversion was not attempted\n", "head")
+            self.write(report["blocked"] + "\n", "err")
+            return
+
+        self._write_attempts(report)
+
+        if not converted:
+            self.right.title_label.configure(text="Conversion - none produced")
+            self._set_verdict("No conversion got through - the original is "
+                              "unchanged", "err")
+            self.write(report.get("reason", "") + "\n", "err")
+            return
+
+        self.right.title_label.configure(text="Converted - NOT verified")
+        self._set_verdict("Converted, NOT verified - it compiles, builds and "
+                          "runs; nothing compared it with your program", "warn")
+        self._show_sides(converted)
+        for button in (self.apply_button, self.save_button):
+            button.set_enabled(True)
+
+        self.write("\n" + "─" * 70 + "\n", "dim")
+        self.write("Converted, NOT verified\n", "head")
+        self.write("  This is the last stage, and the only one that produces a\n"
+                   "  result without proving it equivalent. It is here because\n"
+                   "  a program whose behaviour is a window has no output to\n"
+                   "  compare, so the usual proof is not available at all - and\n"
+                   "  refusing to do anything would leave the program\n"
+                   "  untranslated for no gain.\n\n", "dim")
+        self.write("  What was established:\n", "")
+        for item in report.get("proof", []):
+            self.write("    + %s\n" % item, "ok")
+        self.write("  What was NOT established:\n", "")
+        self.write("    ! that it behaves like your program. Nothing\n"
+                   "      compared them, because there was nothing to\n"
+                   "      compare.\n", "err")
 
     def show_result(self, repaired, report):
         self.repaired = repaired
@@ -1896,11 +1949,74 @@ class TranslationCompilerApp:
         self.repair_button.set_enabled(False)
         self.set_status("Checking the answer you wrote, the same way a model's "
                         "would be checked...")
+        worker = (self._port_worker if getattr(window, "stage", "repair") == "port"
+                  else self._repair_worker)
         threading.Thread(
-            target=self._repair_worker,
+            target=worker,
             args=(window.source, window.error, self.model_var.get(), window),
             kwargs={"ask": make_ask(self.buffer_folder(window.source),
                                     verbose=False)},
+            daemon=True).start()
+
+    def _port_worker(self, source, error, model, window, ask=None):
+        """The last stage. Same shape as the repair worker, different promise."""
+        from src.ai_assist.port import port
+        from tools.repair_offline import NeedAnswer
+
+        def progress(stage, text, ok):
+            self.root.after(0, lambda: self._repair_progress(window, stage, text, ok))
+
+        try:
+            converted, report = port(
+                source, error=error, model=model,
+                use_ai=bool(self.ai_var.get()), progress=progress, ask=ask,
+                reason=getattr(window, "why_unverifiable", ""))
+        except NeedAnswer as need:
+            self.root.after(0, lambda: self._on_answer_wanted(window, need))
+            return
+        except Exception as error_obj:
+            message = f"{type(error_obj).__name__}: {error_obj}"
+            self.root.after(0, lambda: self._on_repair_failed(window, message))
+            return
+        self.root.after(0, lambda: self._on_port_done(window, converted, report))
+
+    def _on_port_done(self, window, converted, report):
+        self._finish_repair()
+        try:
+            window.show_port_result(converted, report)
+        except tk.TclError:
+            pass
+        attempts = report.get("attempts") or []
+        if (not converted and attempts and attempts[-1].get("unreachable")
+                and self._hand_the_question_over(window, report)):
+            return
+        if converted:
+            self.set_status("Converted, NOT verified - it compiles, builds and "
+                            "runs; nothing compared it with your program", "warn")
+        else:
+            self.set_status("No conversion produced - nothing was changed", "err")
+
+    def _start_port(self, window, report):
+        """Chain into the conversion stage after repair could not run."""
+        window.stage = "port"
+        window.why_unverifiable = report.get("blocked", "")
+        self.busy = True
+        self.translate_button.set_enabled(False)
+        self.repair_button.set_enabled(False)
+        self.set_status("Nothing can be verified by output here - converting "
+                        "instead, and it will say so")
+        try:
+            window.write("\n" + "─" * 70 + "\n", "dim")
+            window.write("Falling through to the last stage\n", "head")
+            window.write("  There is no output to compare, so no repair can be\n"
+                         "  proved. Rather than stop, the program is converted\n"
+                         "  into the subset and the result is reported for what\n"
+                         "  it is: compiled and running, not verified.\n\n", "dim")
+        except tk.TclError:
+            pass
+        threading.Thread(
+            target=self._port_worker,
+            args=(window.source, window.error, self.model_var.get(), window),
             daemon=True).start()
 
     def _repair_worker(self, source, error, model, window, ask=None):
@@ -1998,6 +2114,15 @@ class TranslationCompilerApp:
         attempts = report.get("attempts") or []
         if (not repaired and attempts and attempts[-1].get("unreachable")
                 and self._hand_the_question_over(window, report)):
+            return
+        # Fall through to the conversion stage only when verifying was
+        # IMPOSSIBLE, which is what `blocked` means: a window, a program that
+        # never finishes, one that disagrees with itself. Not when it was
+        # possible and the answers were simply wrong - there, an unverified
+        # result would be a downgrade, and offering one would undercut every
+        # other guarantee this program makes.
+        if report.get("blocked") and not repaired:
+            self.root.after(300, lambda: self._start_port(window, report))
             return
         if report.get("blocked"):
             self.set_status("Not repairable: " + report["blocked"].splitlines()[0][:90],
