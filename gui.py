@@ -1314,11 +1314,31 @@ class RepairWindow(tk.Toplevel):
             pass                       # the window was closed
 
     def continue_repair(self):
+        """Take the answer that is on disk, or say plainly that there is none.
+
+        Pressing this with the file still unwritten used to start the whole
+        round again, which asked for the answer, found nothing, and handed
+        the question back - a loop that looked like the window had hung. The
+        file is the thing being waited on, so the check belongs here."""
         if not self.pending:
+            return
+        attempt, prompt_path, answer_path = self.pending
+        try:
+            written = os.path.getsize(answer_path)
+        except OSError:
+            written = 0
+        if written == 0:
+            self.write("\n  There is no answer yet. Nothing has been skipped and\n"
+                       "  nothing has gone wrong - the file below is still empty:\n", "warn")
+            self.write("    %s\n" % answer_path, "dim")
+            self.write("  Write the rewrite into it and save. It is picked up on\n"
+                       "  its own; this button is only the impatient way to do\n  the same thing.\n", "dim")
+            self._set_verdict("Still waiting - the answer file is empty", "warn")
+            self.continue_button.set_enabled(True)
             return
         self.continue_button.set_enabled(False)
         self.pending = None
-        self.write("\n  reading the answer file...\n", "dim")
+        self.write("\n  reading the answer file (%d bytes)...\n" % written, "dim")
         self._set_verdict("Working - checking the answer you wrote", "warn")
         self.app.resume_repair(self)
 

@@ -46,3 +46,6 @@ tools/ppt/package.json
 presentation/slide-*.jpg
 presentation/screenshots/_build/
 presentation/screenshots/_shot.ps1
+
+# Office lock files, left behind while a document is open.
+~$*
