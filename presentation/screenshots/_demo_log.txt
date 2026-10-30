@@ -1,0 +1,29 @@
+1. loading the pygame program and translating it with AI assist on
+2. the pipeline fell through and asked for an answer
+  ok   the window is on the conversion stage
+  ok   a prompt was written
+     C:\Users\ACER\Desktop\translation-compiler\reports\repair_buffer\factorial-f6b043e5\prompt-1.md
+     C:\Users\ACER\Desktop\translation-compiler\reports\repair_buffer\factorial-f6b043e5\answer-1.py
+3. writing the conversion into the buffer, then touching nothing
+4. the verdict
+  ok   it was converted
+  ok   it is not reported as verified
+  ok   the C was produced
+     + it is valid Python and declares main()
+     + the whole compiler accepts it, with no stage special-cased
+     + the C it produced builds and links (284486 bytes of executable)
+     + it started and was still running after 3s, so it was stopped - which is what a program
+5. building the conversion and starting it
+  ok   the C builds
+     284486 bytes of executable
+  ok   the program is still running two seconds later
+
+PASS - the pygame program is converted, built and running
+
+Both windows are left open on purpose:
+  - the IDE, showing CONVERTED, NOT VERIFIED and the two programs
+  - the cube itself, running as a native binary
+Controls: 1 2 3 select, U D F B R L turn, SHIFT reverse,
+          S scramble, X reset, SPACE scramble all, ESC quit.
+Close them yourself when you are done.
+DONE-PASS

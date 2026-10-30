@@ -1281,8 +1281,15 @@ class RepairWindow(tk.Toplevel):
         self.write("    %s\n" % prompt_path, "dim")
         self.write("  write the rewrite into:\n", "")
         self.write("    %s\n" % answer_path, "dim")
-        self.write("\n  It is picked up as soon as you save it. The"
-                   " button below\n  does the same thing if you would rather not wait.\n", "")
+        self.write("\n  Nothing will write that file for you. No model is"
+                   " being contacted\n"
+                   "  and nothing is downloading. The window waits here, for"
+                   " as long\n"
+                   "  as it takes, until that file exists. That is not a"
+                   " fault.\n\n", "warn")
+        self.write("  It is picked up the moment it is saved. The button"
+                   " below\n"
+                   "  does the same thing if you would rather not wait.\n", "")
         self.continue_button.set_enabled(True)
         self._answer_size = -1
         self._watch_answer()
@@ -1994,23 +2001,24 @@ class TranslationCompilerApp:
     def buffer_folder(self, source):
         """Where the question and the answer live, for this exact program.
 
-        The name carries a digest of the source, not just the file name. The
-        file name is whatever the editor last had open, which is not the same
-        thing as the program in the pane - and if two programs shared a
-        folder, a stale answer written for one would be picked up and judged
-        against the other's output. It would be refused, so nothing unsound
-        gets through, but the refusal would make no sense to read.
+        Named after a digest of the source and nothing else.
 
-        Keying on the source instead means an answer stays valid for the
-        program it was written for, across sessions, and is never offered for
-        anything else. Edit the program and you get a new folder, which is
-        correct: the old answer was for the old program.
+        It used to carry the editor's file name as well, and that was wrong
+        in a way that wasted an afternoon: the file name is whatever was last
+        OPENED, not the program in the pane. Paste a program in and the
+        folder is named after the previous file; open the same program from
+        disk and it is named after itself. Same program, two folders - and an
+        answer written into one is invisible from the other, so the window
+        waits for a file that is sitting right there under another name.
+
+        The digest alone means one program is always one folder, however it
+        got into the editor. Edit the program and you get a new folder, which
+        is correct: the old answer was written for the old program.
         """
         import hashlib
 
         digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:8]
-        folder = os.path.join(REPORTS_DIR, "repair_buffer",
-                              "%s-%s" % (self._base_name(), digest))
+        folder = os.path.join(REPORTS_DIR, "repair_buffer", digest)
         os.makedirs(folder, exist_ok=True)
         return folder
 
