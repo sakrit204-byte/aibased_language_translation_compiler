@@ -49,3 +49,8 @@ presentation/screenshots/_shot.ps1
 
 # Office lock files, left behind while a document is open.
 ~$*
+
+# Scratch output from the reference-document build.
+tools/doc/node_modules/
+tools/doc/package-lock.json
+tools/doc/package.json
